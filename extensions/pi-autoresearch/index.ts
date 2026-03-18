@@ -205,10 +205,16 @@ function formatNum(value: number | null, unit: string): string {
   return fmtNum(value, 2) + u;
 }
 
-/** Generate a unique temp file path for experiment output */
-function getTempFilePath(): string {
-  const id = randomBytes(8).toString("hex");
-  return path.join(tmpdir(), `pi-experiment-${id}.log`);
+/** Lazy temp file allocator — returns the same path on subsequent calls */
+function createTempFileAllocator(): () => string {
+  let p: string | undefined;
+  return () => {
+    if (!p) {
+      const id = randomBytes(8).toString("hex");
+      p = path.join(tmpdir(), `pi-experiment-${id}.log`);
+    }
+    return p;
+  };
 }
 
 /** Format elapsed milliseconds as "Xm XXs" or "XXs" */
@@ -1244,10 +1250,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const t0 = Date.now();
 
       // Spawn the process directly (like the bash tool) for streaming output
-      const { exitCode, killed: timedOut, output } = await new Promise<{
+      const getTempFile = createTempFileAllocator();
+      const { exitCode, killed: timedOut, output, tempFilePath: streamTempFile } = await new Promise<{
         exitCode: number | null;
         killed: boolean;
         output: string;
+        tempFilePath: string | undefined;
       }>((resolve, reject) => {
         let processTimedOut = false;
 
@@ -1293,7 +1301,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
           // Start writing to temp file once we exceed the threshold
           if (totalBytes > DEFAULT_MAX_BYTES && !tempFilePath) {
-            tempFilePath = getTempFilePath();
+            tempFilePath = getTempFile();
             tempFileStream = createWriteStream(tempFilePath);
             for (const chunk of chunks) {
               tempFileStream.write(chunk);
@@ -1362,6 +1370,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             exitCode: code,
             killed: processTimedOut,
             output: fullBuffer.toString("utf-8"),
+            tempFilePath,
           });
         });
       }).finally(() => {
@@ -1405,12 +1414,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       const passed = benchmarkPassed && (checksPass === null || checksPass);
 
-      // Save full output to temp file when large
-      let fullOutputPath: string | undefined;
+      // Reuse streaming temp file if it exists, otherwise create one for large output
+      let fullOutputPath: string | undefined = streamTempFile;
       const totalBytes = Buffer.byteLength(output, "utf-8");
       const totalLines = output.split("\n").length;
-      if (totalBytes > EXPERIMENT_MAX_BYTES || totalLines > EXPERIMENT_MAX_LINES) {
-        fullOutputPath = getTempFilePath();
+      if (!fullOutputPath && (totalBytes > EXPERIMENT_MAX_BYTES || totalLines > EXPERIMENT_MAX_LINES)) {
+        fullOutputPath = getTempFile();
         fs.writeFileSync(fullOutputPath, output);
       }
 
