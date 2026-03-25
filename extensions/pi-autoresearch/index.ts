@@ -1313,7 +1313,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           metricUnit: state.metricUnit,
           bestDirection: state.bestDirection,
         });
-        if (isReinit) {
+        if (fs.existsSync(jsonlPath)) {
           fs.appendFileSync(jsonlPath, config + "\n");
         } else {
           fs.writeFileSync(jsonlPath, config + "\n");
@@ -2353,7 +2353,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             handleInput(data: string): void {
               const termH = process.stdout.rows || 40;
               const viewportRows = Math.max(4, termH - 4);
-              const totalRows = state.results.length + (runtime.runningExperiment ? 1 : 0) + 15; // rough estimate
+              const actualContent = renderDashboardLines(state, process.stdout.columns || 120, theme, 0);
+              const totalRows = actualContent.length + (runtime.runningExperiment ? 1 : 0);
               const maxScroll = Math.max(0, totalRows - viewportRows);
 
               if (matchesKey(data, "escape") || data === "q") {
@@ -2447,6 +2448,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         } else {
           ctx.ui.notify("No autoresearch.jsonl found. Autoresearch mode OFF", "info");
         }
+        return;
+      }
+
+      if (runtime.autoresearchMode) {
+        ctx.ui.notify("Autoresearch already active — use '/autoresearch off' to stop first", "info");
         return;
       }
 
