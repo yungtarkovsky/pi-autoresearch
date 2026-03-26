@@ -27,34 +27,39 @@ YELLOW='\033[0;33m'
 NC='\033[0m'
 
 DATA_DIR=""
+ORIG_BRANCH=""
+TRUNK=""
+BASE=""
+FINAL_TREE=""
+GOAL=""
+GROUP_COUNT=""
+STASHED=false
+CREATED_BRANCHES=()
+declare -a GROUP_BRANCH
+
 warn() { echo -e "${YELLOW}⚠ $1${NC}"; }
 info() { echo -e "${GREEN}$1${NC}"; }
 cleanup_data() { if [ -d "${DATA_DIR:-}" ]; then rm -rf "$DATA_DIR"; fi; }
 fail() { cleanup_data; echo -e "${RED}ERROR: $1${NC}" >&2; exit 1; }
 
-# Session artifacts to exclude — matched by basename
-is_session_file() { local base; base=$(basename "$1"); case "$base" in autoresearch.*) return 0;; *) return 1;; esac; }
+is_session_file() {
+  local base
+  base=$(basename "$1")
+  case "$base" in autoresearch.*) return 0;; *) return 1;; esac
+}
 
 # ---------------------------------------------------------------------------
-# Args
+# Parse
 # ---------------------------------------------------------------------------
 
-if [ $# -lt 1 ]; then
-  echo "Usage: $0 <groups.json>"
-  exit 1
-fi
+parse_groups() {
+  local groups_file="$1"
+  [ -f "$groups_file" ] || fail "$groups_file not found"
 
-GROUPS_FILE="$1"
-[ -f "$GROUPS_FILE" ] || fail "$GROUPS_FILE not found"
-
-# ---------------------------------------------------------------------------
-# Parse groups.json (single node call)
-# ---------------------------------------------------------------------------
-
-DATA_DIR=$(mktemp -d)
-node -e "
+  DATA_DIR=$(mktemp -d)
+  node -e "
 const fs = require('fs');
-const g = JSON.parse(fs.readFileSync('$GROUPS_FILE', 'utf-8'));
+const g = JSON.parse(fs.readFileSync('$groups_file', 'utf-8'));
 fs.writeFileSync('$DATA_DIR/base', g.base);
 fs.writeFileSync('$DATA_DIR/trunk', g.trunk || 'main');
 fs.writeFileSync('$DATA_DIR/final_tree', g.final_tree);
@@ -66,103 +71,119 @@ g.groups.forEach((x, i) => {
   fs.writeFileSync('$DATA_DIR/' + i + '.last_commit', x.last_commit);
   fs.writeFileSync('$DATA_DIR/' + i + '.slug', x.slug);
 });
-" || fail "Failed to parse $GROUPS_FILE — check JSON syntax."
+" || fail "Failed to parse $groups_file — check JSON syntax."
 
-BASE=$(cat "$DATA_DIR/base")
-TRUNK=$(cat "$DATA_DIR/trunk")
-FINAL_TREE=$(cat "$DATA_DIR/final_tree")
-GOAL=$(cat "$DATA_DIR/goal")
-GROUP_COUNT=$(cat "$DATA_DIR/count")
+  BASE=$(cat "$DATA_DIR/base")
+  TRUNK=$(cat "$DATA_DIR/trunk")
+  FINAL_TREE=$(cat "$DATA_DIR/final_tree")
+  GOAL=$(cat "$DATA_DIR/goal")
+  GROUP_COUNT=$(cat "$DATA_DIR/count")
+}
 
 # ---------------------------------------------------------------------------
 # Preflight
 # ---------------------------------------------------------------------------
 
-echo ""
-info "═══ Preflight ═══"
-echo ""
+assert_on_feature_branch() {
+  ORIG_BRANCH=$(git branch --show-current 2>/dev/null || echo "")
+  [ -n "$ORIG_BRANCH" ] || fail "Detached HEAD — switch to the autoresearch branch first."
+  [ "$ORIG_BRANCH" != "$TRUNK" ] || fail "On trunk ($TRUNK) — switch to the autoresearch branch first."
+}
 
-ORIG_BRANCH=$(git branch --show-current 2>/dev/null || echo "")
-[ -n "$ORIG_BRANCH" ] || fail "Detached HEAD — switch to the autoresearch branch first."
-[ "$ORIG_BRANCH" != "$TRUNK" ] || fail "On trunk ($TRUNK) — switch to the autoresearch branch first."
+assert_commits_exist() {
+  git rev-parse "$BASE" >/dev/null 2>&1 || fail "Base commit $BASE not found."
+  git rev-parse "$FINAL_TREE" >/dev/null 2>&1 || fail "Final tree commit $FINAL_TREE not found."
+}
 
-git rev-parse "$BASE" >/dev/null 2>&1 || fail "Base commit $BASE not found."
-git rev-parse "$FINAL_TREE" >/dev/null 2>&1 || fail "Final tree commit $FINAL_TREE not found."
+collect_group_files() {
+  local i="$1" prev_commit="$2"
+  local last_commit all_group_files files
 
-# Validate commits, collect file lists, check for overlaps and branch collisions
-PREV_COMMIT="$BASE"
-ALL_FILES_SEEN=""
-declare -a GROUP_BRANCH
-for i in $(seq 0 $((GROUP_COUNT - 1))); do
-  LC=$(cat "$DATA_DIR/$i.last_commit")
-  SLUG=$(cat "$DATA_DIR/$i.slug")
-  git rev-parse "$LC" >/dev/null 2>&1 || fail "Group $((i+1)) last_commit $LC not found. Use full hashes (git rev-parse <short>)."
+  last_commit=$(cat "$DATA_DIR/$i.last_commit")
+  git rev-parse "$last_commit" >/dev/null 2>&1 \
+    || fail "Group $((i+1)) last_commit $last_commit not found. Use full hashes (git rev-parse <short>)."
 
-  # Get files changed in this group (incremental diff, excluding session files)
-  if ! ALL_GROUP_FILES=$(git diff --name-only "$PREV_COMMIT" "$LC" 2>&1); then
-    fail "git diff failed for group $((i+1)): $ALL_GROUP_FILES"
+  if ! all_group_files=$(git diff --name-only "$prev_commit" "$last_commit" 2>&1); then
+    fail "git diff failed for group $((i+1)): $all_group_files"
   fi
-  FILES=""
-  for f in $ALL_GROUP_FILES; do
-    is_session_file "$f" || FILES=$(printf '%s\n%s' "$FILES" "$f")
-  done
-  FILES=$(echo "$FILES" | sed '/^$/d')
-  echo "$FILES" > "$DATA_DIR/$i.files"
 
-  # Check for overlapping files between groups
-  for f in $FILES; do
-    if echo "$ALL_FILES_SEEN" | grep -qxF "$f"; then
+  files=""
+  for f in $all_group_files; do
+    is_session_file "$f" || files=$(printf '%s\n%s' "$files" "$f")
+  done
+  echo "$files" | sed '/^$/d' > "$DATA_DIR/$i.files"
+  cat "$DATA_DIR/$i.files"
+}
+
+assert_no_overlapping_files() {
+  local new_files="$1" all_seen="$2"
+  for f in $new_files; do
+    if echo "$all_seen" | grep -qxF "$f"; then
       fail "File '$f' appears in multiple groups. Merge the overlapping groups and retry."
     fi
   done
-  if [ -z "$ALL_FILES_SEEN" ]; then
-    ALL_FILES_SEEN="$FILES"
-  else
-    ALL_FILES_SEEN=$(printf '%s\n%s' "$ALL_FILES_SEEN" "$FILES")
+}
+
+assert_branch_available() {
+  local branch_name="$1"
+  if git rev-parse --verify "$branch_name" >/dev/null 2>&1; then
+    fail "Branch '$branch_name' already exists. Delete it first or use a different goal slug."
   fi
+}
 
-  # Check for branch name collision
-  NN=$(printf "%02d" $((i + 1)))
-  BRANCH_NAME="autoresearch/${GOAL}/${NN}-${SLUG}"
-  GROUP_BRANCH[$i]=""
-  if git rev-parse --verify "$BRANCH_NAME" >/dev/null 2>&1; then
-    fail "Branch '$BRANCH_NAME' already exists. Delete it first or use a different goal slug."
-  fi
+preflight() {
+  echo ""
+  info "═══ Preflight ═══"
+  echo ""
 
-  PREV_COMMIT="$LC"
-done
+  assert_on_feature_branch
+  assert_commits_exist
 
-# Check verify branch collision too
-VERIFY_BRANCH="autoresearch/${GOAL}/verify-tmp"
-if git rev-parse --verify "$VERIFY_BRANCH" >/dev/null 2>&1; then
-  fail "Branch '$VERIFY_BRANCH' already exists. Delete it first."
-fi
+  local prev_commit="$BASE"
+  local all_files_seen=""
 
-info "Preflight passed."
-echo "  Branch:     $ORIG_BRANCH"
-echo "  Base:       ${BASE:0:12}"
-echo "  Groups:     $GROUP_COUNT"
+  for i in $(seq 0 $((GROUP_COUNT - 1))); do
+    local files
+    files=$(collect_group_files "$i" "$prev_commit")
+
+    assert_no_overlapping_files "$files" "$all_files_seen"
+
+    if [ -z "$all_files_seen" ]; then
+      all_files_seen="$files"
+    else
+      all_files_seen=$(printf '%s\n%s' "$all_files_seen" "$files")
+    fi
+
+    local group_number branch_name
+    group_number=$(printf "%02d" $((i + 1)))
+    branch_name="autoresearch/${GOAL}/${group_number}-$(cat "$DATA_DIR/$i.slug")"
+    assert_branch_available "$branch_name"
+    GROUP_BRANCH[$i]=""
+
+    prev_commit=$(cat "$DATA_DIR/$i.last_commit")
+  done
+
+  assert_branch_available "autoresearch/${GOAL}/verify-tmp"
+
+  info "Preflight passed."
+  echo "  Branch:     $ORIG_BRANCH"
+  echo "  Base:       ${BASE:0:12}"
+  echo "  Groups:     $GROUP_COUNT"
+}
 
 # ---------------------------------------------------------------------------
 # Create branches
 # ---------------------------------------------------------------------------
 
-echo ""
-info "═══ Creating branches ═══"
-echo ""
-
-STASHED=false
-CREATED_BRANCHES=()
-
-cleanup_on_failure() {
+rollback_on_failure() {
   local exit_code=$?
   if [ $exit_code -eq 0 ]; then return; fi
 
   echo ""
   echo -e "${RED}FAILED — rolling back...${NC}"
   git reset --quiet HEAD -- . 2>/dev/null || true
-  for b in "${CREATED_BRANCHES[@]}"; do
-    git branch -D "$b" 2>/dev/null || true
+  for branch in "${CREATED_BRANCHES[@]}"; do
+    git branch -D "$branch" 2>/dev/null || true
   done
   if [ -n "${ORIG_BRANCH:-}" ]; then
     git checkout "$ORIG_BRANCH" --quiet 2>/dev/null || true
@@ -173,191 +194,241 @@ cleanup_on_failure() {
   cleanup_data
   echo -e "${RED}Rolled back to '$ORIG_BRANCH'. No branches left behind.${NC}"
 }
-trap cleanup_on_failure EXIT
 
-if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null || [ -n "$(git ls-files --others --exclude-standard 2>/dev/null)" ]; then
-  warn "Stashing uncommitted changes..."
-  git stash -u
-  STASHED=true
-fi
+stash_if_dirty() {
+  if ! git diff --quiet 2>/dev/null \
+    || ! git diff --cached --quiet 2>/dev/null \
+    || [ -n "$(git ls-files --others --exclude-standard 2>/dev/null)" ]; then
+    warn "Stashing uncommitted changes..."
+    git stash -u
+    STASHED=true
+  fi
+}
 
-for i in $(seq 0 $((GROUP_COUNT - 1))); do
-  TITLE=$(cat "$DATA_DIR/$i.title")
-  BODY=$(cat "$DATA_DIR/$i.body")
-  LAST_COMMIT=$(cat "$DATA_DIR/$i.last_commit")
-  SLUG=$(cat "$DATA_DIR/$i.slug")
-  FILES=$(cat "$DATA_DIR/$i.files")
+create_group_branch() {
+  local i="$1"
+  local title body last_commit slug files group_number branch_name
 
-  NN=$(printf "%02d" $((i + 1)))
-  BRANCH_NAME="autoresearch/${GOAL}/${NN}-${SLUG}"
+  title=$(cat "$DATA_DIR/$i.title")
+  body=$(cat "$DATA_DIR/$i.body")
+  last_commit=$(cat "$DATA_DIR/$i.last_commit")
+  slug=$(cat "$DATA_DIR/$i.slug")
+  files=$(cat "$DATA_DIR/$i.files")
 
-  info "[$NN/$GROUP_COUNT] $TITLE"
+  group_number=$(printf "%02d" $((i + 1)))
+  branch_name="autoresearch/${GOAL}/${group_number}-${slug}"
 
-  if [ -z "$FILES" ]; then
+  info "[$group_number/$GROUP_COUNT] $title"
+
+  if [ -z "$files" ]; then
     warn "No files changed — skipping this group"
     GROUP_BRANCH[$i]="skipped"
-    continue
+    return
   fi
 
-  # Each branch starts from merge-base independently
   git checkout "$BASE" --quiet --detach 2>/dev/null || git checkout "$BASE" --quiet
-  git checkout -b "$BRANCH_NAME"
+  git checkout -b "$branch_name"
 
-  # Pull each file's final state from the last kept commit in this group
-  for f in $FILES; do
-    git checkout "$LAST_COMMIT" -- "$f"
+  for changed_file in $files; do
+    git checkout "$last_commit" -- "$changed_file"
   done
-  git commit -m "$TITLE" -m "$BODY"
+  git commit -m "$title" -m "$body"
 
-  CREATED_BRANCHES+=("$BRANCH_NAME")
-  GROUP_BRANCH[$i]="$BRANCH_NAME"
-  echo "  Branch: $BRANCH_NAME"
-  echo "  Files: $FILES"
+  CREATED_BRANCHES+=("$branch_name")
+  GROUP_BRANCH[$i]="$branch_name"
+  echo "  Branch: $branch_name"
+  echo "  Files: $files"
   echo ""
-done
+}
 
-info "Created ${#CREATED_BRANCHES[@]} branches (all from merge-base, independent):"
-for b in "${CREATED_BRANCHES[@]}"; do echo "  $b"; done
+create_branches() {
+  echo ""
+  info "═══ Creating branches ═══"
+  echo ""
 
-# Disarm rollback trap — creation succeeded
-trap - EXIT
+  trap rollback_on_failure EXIT
+  stash_if_dirty
+
+  for i in $(seq 0 $((GROUP_COUNT - 1))); do
+    create_group_branch "$i"
+  done
+
+  info "Created ${#CREATED_BRANCHES[@]} branches (all from merge-base, independent):"
+  for branch in "${CREATED_BRANCHES[@]}"; do echo "  $branch"; done
+
+  trap - EXIT
+}
 
 # ---------------------------------------------------------------------------
 # Verify
 # ---------------------------------------------------------------------------
 
-echo ""
-info "═══ Verifying ═══"
-echo ""
+verify_union_matches_original() {
+  local verify_branch="autoresearch/${GOAL}/verify-tmp"
 
-VERIFY_ERRORS=0
+  git checkout "$BASE" --quiet --detach 2>/dev/null || git checkout "$BASE" --quiet
+  git checkout -b "$verify_branch"
 
-# 1. Union of all branch trees should match the autoresearch branch (excluding session files)
-git checkout "$BASE" --quiet --detach 2>/dev/null || git checkout "$BASE" --quiet
-git checkout -b "$VERIFY_BRANCH"
-for i in $(seq 0 $((GROUP_COUNT - 1))); do
-  FILES=$(cat "$DATA_DIR/$i.files")
-  LAST_COMMIT=$(cat "$DATA_DIR/$i.last_commit")
-  for f in $FILES; do
-    git checkout "$LAST_COMMIT" -- "$f"
+  for i in $(seq 0 $((GROUP_COUNT - 1))); do
+    local files last_commit
+    files=$(cat "$DATA_DIR/$i.files")
+    last_commit=$(cat "$DATA_DIR/$i.last_commit")
+    for changed_file in $files; do
+      git checkout "$last_commit" -- "$changed_file"
+    done
   done
-done
-git commit --allow-empty -m "verify: union of all groups" --quiet
+  git commit --allow-empty -m "verify: union of all groups" --quiet
 
-# Compare union against original, filtering out session files
-TREE_DIFF_RAW=$(git diff HEAD "$FINAL_TREE" 2>/dev/null || echo "DIFF_FAILED")
-if [ "$TREE_DIFF_RAW" = "DIFF_FAILED" ]; then
-  echo -e "${RED}✗ Could not diff union against original tree.${NC}"
-  VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
-else
-  # Check if any non-session files differ
-  NON_SESSION_DIFF=""
-  for f in $(git diff --name-only HEAD "$FINAL_TREE" 2>/dev/null); do
-    is_session_file "$f" || NON_SESSION_DIFF="$NON_SESSION_DIFF $f"
+  local non_session_diff=""
+  for changed_file in $(git diff --name-only HEAD "$FINAL_TREE" 2>/dev/null); do
+    is_session_file "$changed_file" || non_session_diff="$non_session_diff $changed_file"
   done
-  if [ -n "$NON_SESSION_DIFF" ]; then
+
+  git checkout "$ORIG_BRANCH" --quiet 2>/dev/null || true
+  git branch -D "$verify_branch" 2>/dev/null || true
+
+  if [ -n "$non_session_diff" ]; then
     echo -e "${RED}✗ Union of groups differs from autoresearch branch!${NC}"
-    echo "  Files:$NON_SESSION_DIFF"
-    VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
-  else
-    echo -e "${GREEN}✓ Union of all groups matches original autoresearch branch.${NC}"
+    echo "  Files:$non_session_diff"
+    return 1
   fi
-fi
 
-# Clean up verify branch
-git checkout "$ORIG_BRANCH" --quiet 2>/dev/null || true
-git branch -D "$VERIFY_BRANCH" 2>/dev/null || true
+  echo -e "${GREEN}✓ Union of all groups matches original autoresearch branch.${NC}"
+  return 0
+}
 
-# 2. Session artifact leak per branch
-ARTIFACT_CLEAN=true
-for b in "${CREATED_BRANCHES[@]}"; do
-  # List all files in the branch's commit diff and check for session files
-  for f in $(git diff-tree --no-commit-id --name-only -r "$(git rev-parse "$b")" 2>/dev/null); do
-    if is_session_file "$f"; then
-      echo -e "${RED}✗ Session artifact '$f' in branch $b!${NC}"
-      VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
-      ARTIFACT_CLEAN=false
+verify_no_session_artifacts() {
+  local clean=true
+  for branch in "${CREATED_BRANCHES[@]}"; do
+    for changed_file in $(git diff-tree --no-commit-id --name-only -r "$(git rev-parse "$branch")" 2>/dev/null); do
+      if is_session_file "$changed_file"; then
+        echo -e "${RED}✗ Session artifact '$changed_file' in branch $branch!${NC}"
+        clean=false
+      fi
+    done
+  done
+
+  if [ "$clean" = true ]; then
+    echo -e "${GREEN}✓ No session artifacts in any branch.${NC}"
+    return 0
+  fi
+  return 1
+}
+
+verify_no_empty_commits() {
+  local errors=0
+  for branch in "${CREATED_BRANCHES[@]}"; do
+    local commit diff
+    commit=$(git rev-parse "$branch" 2>/dev/null)
+    diff=$(git diff-tree --no-commit-id --name-only -r "$commit" 2>/dev/null || echo "")
+    if [ -z "$diff" ]; then
+      echo -e "${RED}✗ Empty commit in $branch${NC}"
+      errors=$((errors + 1))
     fi
   done
-done
-if [ "$ARTIFACT_CLEAN" = true ]; then
-  echo -e "${GREEN}✓ No session artifacts in any branch.${NC}"
-fi
+  return $errors
+}
 
-# 3. Empty commits
-for b in "${CREATED_BRANCHES[@]}"; do
-  COMMIT=$(git rev-parse "$b" 2>/dev/null)
-  DIFF=$(git diff-tree --no-commit-id --name-only -r "$COMMIT" 2>/dev/null || echo "")
-  if [ -z "$DIFF" ]; then
-    echo -e "${RED}✗ Empty commit in $b${NC}"
-    VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
+warn_missing_metric_data() {
+  for branch in "${CREATED_BRANCHES[@]}"; do
+    local msg short
+    msg=$(git log -1 --format="%B" "$branch" 2>/dev/null || echo "")
+    if ! echo "$msg" | grep -qiE '(metric|→|->|%\))'; then
+      short=$(git log -1 --oneline "$branch" 2>/dev/null | head -c 80)
+      warn "Commit $short — no metric data in message"
+    fi
+  done
+}
+
+verify_branches() {
+  echo ""
+  info "═══ Verifying ═══"
+  echo ""
+
+  local errors=0
+
+  verify_union_matches_original || errors=$((errors + 1))
+  verify_no_session_artifacts || errors=$((errors + 1))
+  verify_no_empty_commits || errors=$((errors + $?))
+  warn_missing_metric_data
+
+  echo ""
+  if [ $errors -gt 0 ]; then
+    echo -e "${RED}Verification failed with $errors error(s).${NC}"
+    echo -e "${RED}Branches are intact — inspect and fix manually, or delete and retry.${NC}"
+    echo "  Branches: ${CREATED_BRANCHES[*]}"
+    echo "  You are on: $(git branch --show-current 2>/dev/null || echo 'detached')"
+    cleanup_data
+    exit 1
   fi
-done
-
-# 4. Metric data in commit messages (warning only)
-for b in "${CREATED_BRANCHES[@]}"; do
-  MSG=$(git log -1 --format="%B" "$b" 2>/dev/null || echo "")
-  if ! echo "$MSG" | grep -qiE '(metric|→|->|%\))'; then
-    SHORT=$(git log -1 --oneline "$b" 2>/dev/null | head -c 80)
-    warn "Commit $SHORT — no metric data in message"
-  fi
-done
-
-echo ""
-if [ $VERIFY_ERRORS -gt 0 ]; then
-  echo -e "${RED}Verification failed with $VERIFY_ERRORS error(s).${NC}"
-  echo -e "${RED}Branches are intact — inspect and fix manually, or delete and retry.${NC}"
-  echo "  Branches: ${CREATED_BRANCHES[*]}"
-  echo "  You are on: $(git branch --show-current 2>/dev/null || echo 'detached')"
-  cleanup_data
-  exit 1
-fi
-info "✓ All checks passed."
+  info "✓ All checks passed."
+}
 
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
-echo ""
-info "═══ Summary ═══"
-echo ""
-
-echo "Goal: $GOAL"
-echo "Base: ${BASE:0:12}"
-echo "Source branch: $ORIG_BRANCH"
-echo ""
-
-echo "Branches:"
-for i in $(seq 0 $((GROUP_COUNT - 1))); do
-  TITLE=$(cat "$DATA_DIR/$i.title")
-  BODY=$(cat "$DATA_DIR/$i.body")
-  BRANCH="${GROUP_BRANCH[$i]:-skipped}"
-  FILES=$(cat "$DATA_DIR/$i.files")
-  NN=$(printf "%02d" $((i + 1)))
+print_summary() {
   echo ""
-  echo "  $NN. $TITLE"
-  echo "     Branch: $BRANCH"
-  echo "     Files: $(echo $FILES | tr '\n' ' ')"
+  info "═══ Summary ═══"
   echo ""
-  echo "$BODY" | sed 's/^/     /'
-done
 
-echo ""
-echo "Cleanup — after merging, delete the autoresearch branch and session files:"
-echo ""
-echo "  git branch -D $ORIG_BRANCH"
-echo "  rm -f autoresearch.jsonl autoresearch.sh autoresearch.md autoresearch.ideas.md"
-
-if [ -f "autoresearch.ideas.md" ]; then
+  echo "Goal: $GOAL"
+  echo "Base: ${BASE:0:12}"
+  echo "Source branch: $ORIG_BRANCH"
   echo ""
-  echo "Ideas backlog (from autoresearch.ideas.md):"
+
+  echo "Branches:"
+  for i in $(seq 0 $((GROUP_COUNT - 1))); do
+    local title body branch files group_number
+    title=$(cat "$DATA_DIR/$i.title")
+    body=$(cat "$DATA_DIR/$i.body")
+    branch="${GROUP_BRANCH[$i]:-skipped}"
+    files=$(cat "$DATA_DIR/$i.files")
+    group_number=$(printf "%02d" $((i + 1)))
+    echo ""
+    echo "  $group_number. $title"
+    echo "     Branch: $branch"
+    echo "     Files: $(echo $files | tr '\n' ' ')"
+    echo ""
+    echo "$body" | sed 's/^/     /'
+  done
+
   echo ""
-  sed 's/^/  /' autoresearch.ideas.md
-fi
+  echo "Cleanup — after merging, delete the autoresearch branch and session files:"
+  echo ""
+  echo "  git branch -D $ORIG_BRANCH"
+  echo "  rm -f autoresearch.jsonl autoresearch.sh autoresearch.md autoresearch.ideas.md"
 
-echo ""
-if [ "$STASHED" = true ]; then
-  warn "Changes were stashed. Run 'git stash pop' to restore or 'git stash drop' to discard."
-fi
+  if [ -f "autoresearch.ideas.md" ]; then
+    echo ""
+    echo "Ideas backlog (from autoresearch.ideas.md):"
+    echo ""
+    sed 's/^/  /' autoresearch.ideas.md
+  fi
 
-cleanup_data
+  echo ""
+  if [ "$STASHED" = true ]; then
+    warn "Changes were stashed. Run 'git stash pop' to restore or 'git stash drop' to discard."
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+main() {
+  if [ $# -lt 1 ]; then
+    echo "Usage: $0 <groups.json>"
+    exit 1
+  fi
+
+  parse_groups "$1"
+  preflight
+  create_branches
+  verify_branches
+  print_summary
+  cleanup_data
+}
+
+main "$@"
