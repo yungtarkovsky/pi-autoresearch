@@ -117,6 +117,14 @@ interface LogDetails {
   wallClockSeconds: number | null;
 }
 
+/**
+ * Experiment lifecycle phase — enforced state machine.
+ * idle → running (run_experiment called)
+ * running → pending_log (run_experiment completes)
+ * pending_log → idle (log_experiment called)
+ */
+type ExperimentPhase = 'idle' | 'running' | 'pending_log';
+
 interface AutoresearchRuntime {
   autoresearchMode: boolean;
   dashboardExpanded: boolean;
@@ -131,6 +139,10 @@ interface AutoresearchRuntime {
   iterationStartTokens: number | null;
   /** Token cost of each completed iteration (for predicting context exhaustion). */
   iterationTokenHistory: number[];
+  /** Current phase of the experiment lifecycle state machine */
+  phase: ExperimentPhase;
+  /** Stored result from the last run_experiment, consumed by log_experiment */
+  lastRunResult: RunDetails | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -587,6 +599,8 @@ function createSessionRuntime(): AutoresearchRuntime {
     state: createExperimentState(),
     iterationStartTokens: null,
     iterationTokenHistory: [],
+    phase: 'idle' as ExperimentPhase,
+    lastRunResult: null,
   };
 }
 
@@ -952,6 +966,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     runtime.autoResumeTurns = 0;
     runtime.iterationStartTokens = null;
     runtime.iterationTokenHistory = [];
+    runtime.phase = 'idle';
+    runtime.lastRunResult = null;
     runtime.state = createExperimentState();
 
     let state = runtime.state;
@@ -1154,8 +1170,17 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }
 
         const displayVal = bestPrimary ?? baseline;
+
+        // Phase indicator
+        const phaseTag = runtime.phase === 'running'
+          ? theme.fg("warning", " ⏳running")
+          : runtime.phase === 'pending_log'
+            ? theme.fg("error", " ⏸️pending_log")
+            : "";
+
         const parts = [
           theme.fg("accent", "🔬"),
+          phaseTag,
           theme.fg("muted", ` ${state.results.length} runs`),
           theme.fg("success", ` ${kept} kept`),
           crashed > 0 ? theme.fg("error", ` ${crashed}💥`) : "",
@@ -1231,6 +1256,44 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // Clear running experiment state when agent stops; check ideas file for continuation
   pi.on("agent_end", async (_event, ctx) => {
     const runtime = getRuntime(ctx);
+
+    // ── State machine: auto-save pending results on agent_end ──
+    if (runtime.phase === 'pending_log' && runtime.lastRunResult) {
+      // The agent ended without logging. Persist the result as a crash so it's not lost.
+      const workDir = resolveWorkDir(ctx.cwd);
+      const state = runtime.state;
+      const result = runtime.lastRunResult;
+      const experiment: ExperimentResult = {
+        commit: '',
+        metric: result.parsedPrimary ?? 0,
+        metrics: result.parsedMetrics ? Object.fromEntries(
+          Object.entries(result.parsedMetrics).filter(([k]) => k !== state.metricName)
+        ) : {},
+        status: result.crashed ? 'crash' : 'discard',
+        description: '[auto-saved: agent ended without logging]',
+        timestamp: Date.now(),
+        segment: state.currentSegment,
+        confidence: null,
+        iterationTokens: lastIterationTokens(runtime),
+        asi: { auto_saved: true, reason: 'agent_end_without_log', crashed: result.crashed },
+      };
+      state.results.push(experiment);
+      try {
+        const jsonlPath = path.join(workDir, "autoresearch.jsonl");
+        fs.appendFileSync(jsonlPath, JSON.stringify({ run: state.results.length, ...experiment }) + "\n");
+      } catch { /* best effort */ }
+
+      // Revert working tree on discard/crash
+      try {
+        const protectedFiles = ["autoresearch.jsonl", "autoresearch.md", "autoresearch.ideas.md", "autoresearch.sh", "autoresearch.checks.sh"];
+        const stageCmd = protectedFiles.map((f) => `git add "${path.join(workDir, f)}" 2>/dev/null || true`).join("; ");
+        await pi.exec("bash", ["-c", `${stageCmd}; git checkout -- .; git clean -fd 2>/dev/null`], { cwd: workDir, timeout: 10000 });
+      } catch { /* best effort */ }
+    }
+
+    // Reset state machine
+    runtime.phase = 'idle';
+    runtime.lastRunResult = null;
     runtime.runningExperiment = null;
     if (overlayTui) overlayTui.requestRender();
 
@@ -1438,6 +1501,20 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const runtime = getRuntime(ctx);
       const state = runtime.state;
 
+      // ── State machine gate: only run from 'idle' ──
+      if (runtime.phase === 'pending_log') {
+        return {
+          content: [{ type: "text", text: `❌ Previous experiment hasn't been logged yet. Call log_experiment first before running another experiment.\n\nCurrent phase: pending_log — a completed run is waiting to be recorded.` }],
+          details: {},
+        };
+      }
+      if (runtime.phase === 'running') {
+        return {
+          content: [{ type: "text", text: `❌ An experiment is already running. Wait for it to complete.` }],
+          details: {},
+        };
+      }
+
       // Validate working directory exists
       const workDirError = validateWorkDir(ctx.cwd);
       if (workDirError) {
@@ -1495,6 +1572,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         };
       }
 
+      runtime.phase = 'running';
       runtime.runningExperiment = { startedAt: Date.now(), command: params.command };
       updateWidget(ctx);
       if (overlayTui) overlayTui.requestRender();
@@ -1659,6 +1737,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             actualTotalBytes: totalBytes,
           });
         });
+      }).catch((err) => {
+        // ── State machine: error during running → idle ──
+        runtime.phase = 'idle';
+        runtime.lastRunResult = null;
+        throw err;
       }).finally(() => {
         runtime.runningExperiment = null;
         updateWidget(ctx);
@@ -1808,6 +1891,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (checksPass === false) {
         text += `\n\n── Checks output (last 80 lines) ──\n${details.checksOutput}`;
       }
+
+      // ── State machine: running → pending_log ──
+      runtime.phase = 'pending_log';
+      runtime.lastRunResult = details;
 
       return {
         content: [{ type: "text", text }],
@@ -1963,6 +2050,20 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const runtime = getRuntime(ctx);
       const state = runtime.state;
+
+      // ── State machine gate: only log from 'pending_log' ──
+      if (runtime.phase === 'running') {
+        return {
+          content: [{ type: "text", text: `❌ Experiment is still running. Wait for run_experiment to finish before logging.` }],
+          details: {},
+        };
+      }
+      if (runtime.phase === 'idle') {
+        return {
+          content: [{ type: "text", text: `❌ No experiment to log. Call run_experiment first.\n\nCurrent phase: idle — no pending result to record.` }],
+          details: {},
+        };
+      }
 
       // Validate working directory exists
       const workDirError = validateWorkDir(ctx.cwd);
@@ -2195,8 +2296,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }
       }
 
-      // Clear running experiment and checks state (log_experiment consumes the run)
+      // ── State machine: pending_log → idle ──
       const wallClockSeconds = runtime.lastRunDuration;
+      runtime.phase = 'idle';
+      runtime.lastRunResult = null;
       runtime.runningExperiment = null;
       runtime.lastRunChecks = null;
       runtime.lastRunDuration = null;
@@ -2518,6 +2621,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         runtime.experimentsThisSession = 0;
         runtime.lastRunChecks = null;
         runtime.runningExperiment = null;
+        runtime.phase = 'idle';
+        runtime.lastRunResult = null;
         ctx.ui.notify("Autoresearch mode OFF", "info");
         return;
       }
@@ -2531,6 +2636,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         runtime.experimentsThisSession = 0;
         runtime.lastRunChecks = null;
         runtime.runningExperiment = null;
+        runtime.phase = 'idle';
+        runtime.lastRunResult = null;
         runtime.state = createExperimentState();
         updateWidget(ctx);
 
