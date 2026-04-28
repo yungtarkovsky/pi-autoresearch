@@ -8,7 +8,7 @@
  * - `run_experiment` tool — runs any command, times it, captures output, detects pass/fail
  * - `log_experiment` tool — records results with session-persisted state
  * - Status widget showing experiment count + best metric
- * - Ctrl+X toggle to expand/collapse full dashboard inline above the editor
+ * - Ctrl+Shift+T toggle to expand/collapse full dashboard inline above the editor
  * - Adds autoresearch guidance to the system prompt and points the agent at autoresearch.md
  * - Injects autoresearch.md into context on every turn via before_agent_start
  */
@@ -24,10 +24,27 @@ import { Text, truncateToWidth, matchesKey, visibleWidth } from "@mariozechner/p
 import { Type } from "@sinclair/typebox";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+import { createServer, type Server, type ServerResponse } from "node:http";
+
 import { spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
+
+import {
+  runHook,
+  steerMessageFor,
+  appendHookLogEntryIfConfigured,
+  type HookPayload,
+  type SessionSnapshot,
+} from "./hooks.ts";
+import {
+  parseJsonlEntry,
+  isAutoresearchRunEntry,
+  extractAutoresearchSessionName,
+  reconstructJsonlState,
+} from "./jsonl.ts";
 
 // ---------------------------------------------------------------------------
 // Experiment output limits (sent to LLM — keep small to save context)
@@ -59,8 +76,6 @@ interface ExperimentResult {
   segment: number;
   /** Session-level confidence score at the time this result was logged. null if insufficient data. */
   confidence: number | null;
-  /** Context tokens consumed during this iteration (from run_experiment to log_experiment). null if unavailable. */
-  iterationTokens: number | null;
   /** Actionable Side Information — structured diagnostics for this run */
   asi?: ASI;
 }
@@ -128,21 +143,20 @@ type ExperimentPhase = 'idle' | 'running' | 'pending_log';
 interface AutoresearchRuntime {
   autoresearchMode: boolean;
   dashboardExpanded: boolean;
-  lastAutoResumeTime: number;
   experimentsThisSession: number;
   autoResumeTurns: number;
   lastRunChecks: { pass: boolean; output: string; duration: number } | null;
   lastRunDuration: number | null;
   runningExperiment: { startedAt: number; command: string } | null;
   state: ExperimentState;
-  /** Context tokens at the start of the current run_experiment call. null if not running. */
-  iterationStartTokens: number | null;
-  /** Token cost of each completed iteration (for predicting context exhaustion). */
-  iterationTokenHistory: number[];
   /** Current phase of the experiment lifecycle state machine */
   phase: ExperimentPhase;
   /** Stored result from the last run_experiment, consumed by log_experiment */
   lastRunResult: RunDetails | null;
+  /** Pending auto-resume timer; cancelled when the agent starts a new run or compacts. */
+  pendingResumeTimer: ReturnType<typeof setTimeout> | null;
+  /** Resume message to send when the pending timer fires. */
+  pendingResumeMessage: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -190,7 +204,7 @@ const InitParams = Type.Object({
   ),
 });
 
-const LogParams = Type.Object({
+export const LogParams = Type.Object({
   commit: Type.String({ description: "Git commit hash (short, 7 chars)" }),
   metric: Type.Number({
     description:
@@ -201,7 +215,8 @@ const LogParams = Type.Object({
     description: "Short description of what this experiment tried",
   }),
   metrics: Type.Optional(
-    Type.Record(Type.String(), Type.Number(), {
+    Type.Object({}, {
+      additionalProperties: Type.Number(),
       description:
         'Additional metrics to track as { name: value } pairs, e.g. { "compile_µs": 4200, "render_µs": 9800 }. These are shown alongside the primary metric for tradeoff monitoring.',
     })
@@ -213,7 +228,8 @@ const LogParams = Type.Object({
     })
   ),
   asi: Type.Optional(
-    Type.Record(Type.String(), Type.Unknown(), {
+    Type.Object({}, {
+      additionalProperties: Type.Unknown(),
       description:
         'Actionable Side Information — structured diagnostics for this run. Free-form key/value pairs. Parsed ASI from run_experiment output is merged automatically; use this to add or override fields.',
     })
@@ -360,49 +376,6 @@ function isBetter(
   return direction === "lower" ? current < best : current > best;
 }
 
-// Why 1.2: iterations vary in cost; 20% buffer prevents overflow on heavier iterations
-const CONTEXT_SAFETY_MARGIN = 1.2;
-
-function estimateTokensPerIteration(history: number[]): number {
-  const mean = history.reduce((a, b) => a + b, 0) / history.length;
-  const sorted = [...history].sort((a, b) => a - b);
-  const median = sorted[Math.floor(sorted.length / 2)];
-  // Why max(mean, median): outlier-heavy runs inflate the mean, skewed runs inflate the median.
-  // Taking the larger gives a conservative estimate that handles both distributions.
-  return Math.max(mean, median);
-}
-
-function hasRoomForNextIteration(history: number[], currentTokens: number, contextWindow: number): boolean {
-  if (history.length < 1) return true;
-  const projectedTokens = currentTokens + estimateTokensPerIteration(history) * CONTEXT_SAFETY_MARGIN;
-  return projectedTokens <= contextWindow;
-}
-
-function recordIterationTokens(runtime: AutoresearchRuntime, currentTokens: number | null): void {
-  if (runtime.iterationStartTokens == null || currentTokens == null) return;
-  const tokensConsumed = currentTokens - runtime.iterationStartTokens;
-  if (tokensConsumed <= 0) return;
-  runtime.iterationTokenHistory.push(tokensConsumed);
-}
-
-function lastIterationTokens(runtime: AutoresearchRuntime): number | null {
-  if (runtime.iterationTokenHistory.length === 0) return null;
-  return runtime.iterationTokenHistory[runtime.iterationTokenHistory.length - 1];
-}
-
-function advanceIterationTracking(runtime: AutoresearchRuntime, ctx: ExtensionContext): void {
-  const usage = ctx.getContextUsage();
-  if (usage?.tokens == null) return;
-  recordIterationTokens(runtime, usage.tokens);
-  runtime.iterationStartTokens = usage.tokens;
-}
-
-function isContextExhausted(runtime: AutoresearchRuntime, ctx: ExtensionContext): boolean {
-  const usage = ctx.getContextUsage();
-  if (usage?.tokens == null) return false;
-  return !hasRoomForNextIteration(runtime.iterationTokenHistory, usage.tokens, usage.contextWindow);
-}
-
 /** Compute the median of a numeric array (returns 0 for empty arrays) */
 function sortedMedian(values: number[]): number {
   if (values.length === 0) return 0;
@@ -469,7 +442,7 @@ interface AutoresearchConfig {
 /** Read autoresearch.config.json from the given directory (always ctx.cwd) */
 function readConfig(cwd: string): AutoresearchConfig {
   try {
-    const configPath = path.join(cwd, "autoresearch.config.json");
+    const configPath = autoresearchConfigPath(cwd);
     if (!fs.existsSync(configPath)) return {};
     return JSON.parse(fs.readFileSync(configPath, "utf-8"));
   } catch {
@@ -522,6 +495,30 @@ function findBaselineMetric(results: ExperimentResult[], segment: number): numbe
   return cur.length > 0 ? cur[0].metric : null;
 }
 
+/** Best = optimal metric across kept experiments in current segment (min for lower, max for higher) */
+function findBestMetric(
+  results: ExperimentResult[],
+  segment: number,
+  direction: "lower" | "higher",
+): number | null {
+  const kept = currentResults(results, segment)
+    .filter((r) => r.status === "keep")
+    .map((r) => r.metric);
+  if (kept.length === 0) return null;
+  return direction === "lower" ? Math.min(...kept) : Math.max(...kept);
+}
+
+// -----------------------------------------------------------------------
+// Session file paths (single source of truth for autoresearch.* filenames)
+// -----------------------------------------------------------------------
+
+const autoresearchJsonlPath  = (dir: string) => path.join(dir, "autoresearch.jsonl");
+const autoresearchMdPath     = (dir: string) => path.join(dir, "autoresearch.md");
+const autoresearchIdeasPath  = (dir: string) => path.join(dir, "autoresearch.ideas.md");
+const autoresearchChecksPath = (dir: string) => path.join(dir, "autoresearch.checks.sh");
+const autoresearchScriptPath = (dir: string) => path.join(dir, "autoresearch.sh");
+const autoresearchConfigPath = (dir: string) => path.join(dir, "autoresearch.config.json");
+
 function findBaselineRunNumber(results: ExperimentResult[], segment: number): number | null {
   const index = results.findIndex((result) => result.segment === segment);
   return index >= 0 ? index + 1 : null;
@@ -571,6 +568,59 @@ function cloneExperimentState(state: ExperimentState): ExperimentState {
   };
 }
 
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function truncateDisplayText(text: string, width: number): string {
+  if (width <= 0) return "";
+  return truncateToWidth(text, width, "…", true);
+}
+
+function joinPartsToWidth(parts: string[], width: number): string {
+  let line = "";
+  for (const part of parts) {
+    if (!part) continue;
+    const next = line + part;
+    if (visibleWidth(next) <= width) {
+      line = next;
+      continue;
+    }
+    return truncateToWidth(line || part, width, "…", true);
+  }
+  return truncateToWidth(line, width, "…", true);
+}
+
+function appendRightAlignedAdaptiveHint(
+  left: string,
+  width: number,
+  theme: Theme,
+  candidates: string[]
+): string {
+  if (width <= 0) return "";
+  const leftWidth = visibleWidth(left);
+  for (const candidate of candidates) {
+    const hint = theme.fg("dim", ` ${candidate}`);
+    const hintWidth = visibleWidth(hint);
+    if (hintWidth > width) continue;
+    if (leftWidth + hintWidth <= width) {
+      return left + " ".repeat(Math.max(0, width - leftWidth - hintWidth)) + hint;
+    }
+    const availableLeftWidth = Math.max(0, width - hintWidth);
+    const truncatedLeft = truncateToWidth(left, availableLeftWidth, "…", true);
+    const truncatedLeftWidth = visibleWidth(truncatedLeft);
+    return truncatedLeft + " ".repeat(Math.max(0, width - truncatedLeftWidth - hintWidth)) + hint;
+  }
+  return truncateToWidth(left, width, "…", true);
+}
+
+function getTuiSize(tui: { terminal?: { columns?: number; rows?: number } }): { width: number; height: number } {
+  return {
+    width: tui.terminal?.columns ?? process.stdout.columns ?? 120,
+    height: tui.terminal?.rows ?? process.stdout.rows ?? 40,
+  };
+}
+
 function createExperimentState(): ExperimentState {
   return {
     results: [],
@@ -590,17 +640,16 @@ function createSessionRuntime(): AutoresearchRuntime {
   return {
     autoresearchMode: false,
     dashboardExpanded: false,
-    lastAutoResumeTime: 0,
     experimentsThisSession: 0,
     autoResumeTurns: 0,
     lastRunChecks: null,
     lastRunDuration: null,
     runningExperiment: null,
     state: createExperimentState(),
-    iterationStartTokens: null,
-    iterationTokenHistory: [],
     phase: 'idle' as ExperimentPhase,
     lastRunResult: null,
+    pendingResumeTimer: null,
+    pendingResumeMessage: null,
   };
 }
 
@@ -635,7 +684,8 @@ function renderDashboardLines(
   st: ExperimentState,
   width: number,
   th: Theme,
-  maxRows: number = 6
+  maxRows: number = 6,
+  headerHint?: string
 ): string[] {
   const lines: string[] = [];
 
@@ -760,42 +810,57 @@ function renderDashboardLines(
 
   lines.push("");
 
-  // Determine visible rows for column pruning
+  // Determine visible rows once — used for both column sizing and rendering
   const effectiveMax = maxRows <= 0 ? st.results.length : maxRows;
   const startIdx = Math.max(0, st.results.length - effectiveMax);
-  const visibleRows = st.results.slice(startIdx);
+  const rowsToRender = st.results.slice(startIdx);
 
-  // Only show secondary metric columns that have at least one value in visible rows
+  // Only show secondary metric columns that have at least one value in rendered rows
   const secMetrics = st.secondaryMetrics.filter((sm) =>
-    visibleRows.some((r) => (r.metrics ?? {})[sm.name] !== undefined)
+    rowsToRender.some((r) => (r.metrics ?? {})[sm.name] !== undefined)
   );
 
-  // Column definitions — guarantee 25% of width for description
-  const col = { idx: 3, commit: 8, primary: 11, status: 15 };
-  const secColWidth = 11;
+  // Column definitions
+  // Primary column: "★ " prefix (2 visible) + metric name + 1 padding, clamped to 25% of width
+  const primaryLabel = "★ " + (st.metricName || "metric");
+  const primaryW = Math.max(11, Math.min(Math.floor(width * 0.25), visibleWidth(primaryLabel) + 1));
+  const col = { idx: 3, commit: 8, primary: primaryW, status: 15 };
   const minDescW = Math.max(10, Math.floor(width * 0.25));
   const fixedW = col.idx + col.commit + col.primary + col.status + 6;
-  const availableForSec = width - fixedW - minDescW;
+
+  // Compute each secondary column width from actual content: max(name, widest value) + 1 padding
+  const secColWidths: number[] = secMetrics.map((sm) => {
+    let maxW = visibleWidth(sm.name);
+    for (const r of rowsToRender) {
+      const val = (r.metrics ?? {})[sm.name];
+      if (val !== undefined) {
+        maxW = Math.max(maxW, visibleWidth(formatNum(val, sm.unit)));
+      }
+    }
+    return maxW + 1;
+  });
+
+  const totalSecWidth = () => secColWidths.slice(0, visibleSecMetrics.length).reduce((a, b) => a + b, 0);
 
   // Drop secondary columns from the right until they fit
   let visibleSecMetrics = secMetrics;
-  while (visibleSecMetrics.length > 0 && visibleSecMetrics.length * secColWidth > availableForSec) {
+  while (visibleSecMetrics.length > 0 && totalSecWidth() > width - fixedW - minDescW) {
     visibleSecMetrics = visibleSecMetrics.slice(0, -1);
   }
 
-  const totalSecWidth = visibleSecMetrics.length * secColWidth;
-  const descW = Math.max(minDescW, width - fixedW - totalSecWidth);
+  const descW = Math.max(minDescW, width - fixedW - totalSecWidth());
 
   // Table header — primary metric name bolded with ★
   let headerLine =
     `  ${th.fg("muted", "#".padEnd(col.idx))}` +
     `${th.fg("muted", "commit".padEnd(col.commit))}` +
-    `${th.fg("warning", th.bold(("★ " + st.metricName).slice(0, col.primary - 1).padEnd(col.primary)))}`;
+    `${th.fg("warning", th.bold(truncateToWidth(primaryLabel, col.primary - 1).padEnd(col.primary)))}`;
 
-  for (const sm of visibleSecMetrics) {
+  for (let si = 0; si < visibleSecMetrics.length; si++) {
+    const sm = visibleSecMetrics[si];
     headerLine += th.fg(
       "muted",
-      sm.name.slice(0, secColWidth - 1).padEnd(secColWidth)
+      sm.name.padEnd(secColWidths[si])
     );
   }
 
@@ -803,10 +868,18 @@ function renderDashboardLines(
     `${th.fg("muted", "status".padEnd(col.status))}` +
     `${th.fg("muted", "description")}`;
 
-  lines.push(truncateToWidth(headerLine, width));
+  lines.push(
+    headerHint
+      ? appendRightAlignedAdaptiveHint(headerLine, width, th, [
+          headerHint,
+          "ctrl+shift+t collapse • full: ctrl+shift+f",
+          "ctrl+shift+t • ctrl+shift+f",
+        ])
+      : truncateToWidth(headerLine, width, "…", true)
+  );
   lines.push(
     truncateToWidth(
-      `  ${th.fg("borderMuted", "─".repeat(width - 4))}`,
+      `  ${th.fg("borderMuted", "─".repeat(Math.max(0, width - 4)))}`,
       width
     )
   );
@@ -829,10 +902,12 @@ function renderDashboardLines(
     );
   }
 
+  const baselineIndex = st.results.findIndex((x) => x.segment === st.currentSegment);
+
   for (let i = startIdx; i < st.results.length; i++) {
     const r = st.results[i];
     const isOld = r.segment !== st.currentSegment;
-    const isBaseline = !isOld && i === st.results.findIndex((x) => x.segment === st.currentSegment);
+    const isBaseline = !isOld && i === baselineIndex;
 
     const color = isOld
       ? "dim"
@@ -875,7 +950,9 @@ function renderDashboardLines(
 
     // Secondary metrics (only visible columns)
     const rowMetrics = r.metrics ?? {};
-    for (const sm of visibleSecMetrics) {
+    for (let si = 0; si < visibleSecMetrics.length; si++) {
+      const sm = visibleSecMetrics[si];
+      const colW = secColWidths[si];
       const val = rowMetrics[sm.name];
       if (val !== undefined) {
         const secStr = formatNum(val, sm.unit);
@@ -883,14 +960,14 @@ function renderDashboardLines(
         if (!isOld) {
           const bv = baselineSecondary[sm.name];
           if (isBaseline) {
-            secColor = "text"; // baseline row — normal text
+            secColor = "text";
           } else if (bv !== undefined && bv !== 0) {
             secColor = val <= bv ? "success" : "error";
           }
         }
-        rowLine += th.fg(secColor, secStr.padEnd(secColWidth));
+        rowLine += th.fg(secColor, secStr.padEnd(colW));
       } else {
-        rowLine += th.fg("dim", "—".padEnd(secColWidth));
+        rowLine += th.fg("dim", "—".padEnd(colW));
       }
     }
 
@@ -913,10 +990,148 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const BENCHMARK_GUARDRAIL =
     "Be careful not to overfit to the benchmarks and do not cheat on the benchmarks.";
 
+  // Outlasts pi's internal retry (setTimeout 0) and compaction-continue
+  // (setTimeout 100); see badlogic/pi-mono#2023, #2110.
+  const SETTLED_WINDOW_MS = 800;
+
   const runtimeStore = createRuntimeStore();
   const getSessionKey = (ctx: ExtensionContext) => ctx.sessionManager.getSessionId();
   const getRuntime = (ctx: ExtensionContext): AutoresearchRuntime =>
     runtimeStore.ensure(getSessionKey(ctx));
+
+  const isAgentSettled = (ctx: ExtensionContext): boolean =>
+    ctx.isIdle() && !ctx.hasPendingMessages();
+
+  const hasPendingResume = (runtime: AutoresearchRuntime): boolean =>
+    runtime.pendingResumeMessage !== null;
+
+  const pausePendingResume = (runtime: AutoresearchRuntime): void => {
+    if (!runtime.pendingResumeTimer) return;
+    clearTimeout(runtime.pendingResumeTimer);
+    runtime.pendingResumeTimer = null;
+  };
+
+  const cancelPendingResume = (runtime: AutoresearchRuntime): void => {
+    pausePendingResume(runtime);
+    runtime.pendingResumeMessage = null;
+  };
+
+  const markAutoResumeSent = (runtime: AutoresearchRuntime): void => {
+    runtime.autoResumeTurns++;
+  };
+
+  const sendPendingResumeIfReady = (ctx: ExtensionContext, runtime: AutoresearchRuntime): void => {
+    const message = runtime.pendingResumeMessage;
+
+    if (!message) return;
+    if (!runtime.autoresearchMode) {
+      cancelPendingResume(runtime);
+      return;
+    }
+    if (!isAgentSettled(ctx)) return;
+    if (hasReachedAutoResumeLimit(runtime)) {
+      cancelPendingResume(runtime);
+      notifyAutoResumeLimitReached(ctx);
+      return;
+    }
+
+    cancelPendingResume(runtime);
+    markAutoResumeSent(runtime);
+    pi.sendUserMessage(message);
+  };
+
+  const schedulePendingResume = (ctx: ExtensionContext, runtime: AutoresearchRuntime, message: string): void => {
+    pausePendingResume(runtime);
+    runtime.pendingResumeMessage = message;
+    runtime.pendingResumeTimer = setTimeout(
+      () => sendPendingResumeIfReady(ctx, runtime),
+      SETTLED_WINDOW_MS,
+    );
+  };
+
+  const reschedulePendingResume = (ctx: ExtensionContext, runtime: AutoresearchRuntime): void => {
+    if (!hasPendingResume(runtime)) return;
+    schedulePendingResume(ctx, runtime, runtime.pendingResumeMessage!);
+  };
+
+  const hasRunExperimentsThisSession = (runtime: AutoresearchRuntime): boolean =>
+    runtime.experimentsThisSession > 0;
+
+  // Why the experiment gate: a chat-only turn would otherwise loop forever,
+  // because every agent_end would re-prompt the agent, which would chat again.
+  const shouldAutoResumeAfterTurn = (runtime: AutoresearchRuntime): boolean =>
+    runtime.autoresearchMode && hasRunExperimentsThisSession(runtime);
+
+  const shouldAutoResumeAfterCompact = (runtime: AutoresearchRuntime): boolean =>
+    runtime.autoresearchMode;
+
+  const hasReachedAutoResumeLimit = (runtime: AutoresearchRuntime): boolean =>
+    runtime.autoResumeTurns >= MAX_AUTORESUME_TURNS;
+
+  const notifyAutoResumeLimitReached = (ctx: ExtensionContext): void => {
+    ctx.ui.notify(
+      `Autoresearch auto-resume limit reached (${MAX_AUTORESUME_TURNS} turns)`,
+      "info",
+    );
+  };
+
+  const hasIdeasFile = (ctx: ExtensionContext): boolean =>
+    fs.existsSync(autoresearchIdeasPath(resolveWorkDir(ctx.cwd)));
+
+  const composeResumeMessage = (ctx: ExtensionContext): string => {
+    const parts = [
+      "Autoresearch loop ended (likely context limit and auto-compaction).",
+      "Re-read the persisted autoresearch context before continuing: autoresearch.md (rules), the tail of autoresearch.jsonl (recent kept/discarded runs and ASI), and git log (commits map 1:1 to kept experiments).",
+    ];
+    if (hasIdeasFile(ctx)) {
+      parts.push("Then check autoresearch.ideas.md for promising paths to explore and prune stale/tried ideas.");
+    }
+    parts.push("Resume the experiment loop with the next most promising hypothesis.");
+    parts.push(BENCHMARK_GUARDRAIL);
+    return parts.join(" ");
+  };
+
+  const sendWhenReady = (ctx: ExtensionContext, message: string): void => {
+    if (ctx.isIdle()) {
+      pi.sendUserMessage(message);
+      return;
+    }
+    pi.sendUserMessage(message, { deliverAs: "followUp" });
+  };
+
+  const hasAutoresearchRules = (ctx: ExtensionContext): boolean =>
+    fs.existsSync(autoresearchMdPath(resolveWorkDir(ctx.cwd)));
+
+  const readJsonlLines = (workDir: string): string[] => {
+    const jsonlPath = autoresearchJsonlPath(workDir);
+    if (!fs.existsSync(jsonlPath)) return [];
+    return fs.readFileSync(jsonlPath, "utf-8").split("\n").filter(Boolean);
+  };
+
+  const readLastRun = (workDir: string): Record<string, unknown> | null => {
+    const lines = readJsonlLines(workDir);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const entry = parseJsonlEntry(lines[i]);
+      if (isAutoresearchRunEntry(entry)) return entry;
+    }
+    return null;
+  };
+
+  const buildSessionSnapshot = (state: ExperimentState): SessionSnapshot => ({
+    metric_name: state.metricName,
+    metric_unit: state.metricUnit,
+    direction: state.bestDirection,
+    baseline_metric: state.bestMetric,
+    best_metric: findBestMetric(state.results, state.currentSegment, state.bestDirection),
+    run_count: state.results.length,
+    goal: state.name ?? "",
+  });
+
+  const fireHook = async (payload: HookPayload): Promise<string | null> => {
+    const result = await runHook(payload);
+    appendHookLogEntryIfConfigured(autoresearchJsonlPath(payload.cwd), payload.event, result);
+    return steerMessageFor(payload.event, result);
+  };
 
   // Running experiment state (for spinner in fullscreen overlay)
   let overlayTui: { requestRender: () => void } | null = null;
@@ -941,15 +1156,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   const autoresearchHelp = () =>
     [
-      "Usage: /autoresearch [off|clear|<text>]",
+      "Usage: /autoresearch [off|clear|export|<text>]",
       "",
       "<text> enters autoresearch mode and starts or resumes the loop.",
       "off leaves autoresearch mode.",
       "clear deletes autoresearch.jsonl and turns autoresearch mode off.",
+      "export opens a local live dashboard for autoresearch.jsonl in your browser.",
+
       "",
       "Examples:",
       "  /autoresearch optimize unit test runtime, monitor correctness",
       "  /autoresearch model training, run 5 minutes of train.py and note the loss ratio as optimization target",
+      "  /autoresearch export",
     ].join("\n");
 
   // -----------------------------------------------------------------------
@@ -958,14 +1176,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   const reconstructState = (ctx: ExtensionContext) => {
     const runtime = getRuntime(ctx);
+    cancelPendingResume(runtime);
     runtime.lastRunChecks = null;
     runtime.lastRunDuration = null;
     runtime.runningExperiment = null;
-    runtime.lastAutoResumeTime = 0;
     runtime.experimentsThisSession = 0;
     runtime.autoResumeTurns = 0;
-    runtime.iterationStartTokens = null;
-    runtime.iterationTokenHistory = [];
     runtime.phase = 'idle';
     runtime.lastRunResult = null;
     runtime.state = createExperimentState();
@@ -976,67 +1192,22 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const workDir = resolveWorkDir(ctx.cwd);
 
     // Primary: read from autoresearch.jsonl (alongside autoresearch.md/sh)
-    const jsonlPath = path.join(workDir, "autoresearch.jsonl");
+    const jsonlPath = autoresearchJsonlPath(workDir);
     let loadedFromJsonl = false;
     try {
       if (fs.existsSync(jsonlPath)) {
-        let segment = 0;
-        const lines = fs.readFileSync(jsonlPath, "utf-8").trim().split("\n").filter(Boolean);
-        for (const line of lines) {
-          try {
-            const entry = JSON.parse(line);
+        const reconstructed = reconstructJsonlState(fs.readFileSync(jsonlPath, "utf-8"));
+        state.name = reconstructed.name;
+        state.metricName = reconstructed.metricName;
+        state.metricUnit = reconstructed.metricUnit;
+        state.bestDirection = reconstructed.bestDirection;
+        state.currentSegment = reconstructed.currentSegment;
+        state.results = reconstructed.results.map((result) => ({
+          ...result,
+          metrics: { ...result.metrics },
+        }));
+        state.secondaryMetrics = reconstructed.secondaryMetrics.map((metric) => ({ ...metric }));
 
-            // Config header line — each header starts a new segment
-            if (entry.type === "config") {
-              if (entry.name) state.name = entry.name;
-              if (entry.metricName) state.metricName = entry.metricName;
-              if (entry.metricUnit !== undefined) state.metricUnit = entry.metricUnit;
-              if (entry.bestDirection) state.bestDirection = entry.bestDirection;
-              // Increment segment (first config = 0, second = 1, etc.)
-              if (state.results.length > 0) {
-                segment++;
-                // Reset per-segment tracking (mirrors live reinit behavior)
-                state.secondaryMetrics = [];
-              }
-              state.currentSegment = segment;
-              continue;
-            }
-
-            // Experiment result line
-            const iterationTokens = entry.iterationTokens ?? null;
-            state.results.push({
-              commit: entry.commit ?? "",
-              metric: entry.metric ?? 0,
-              metrics: entry.metrics ?? {},
-              status: entry.status ?? "keep",
-              description: entry.description ?? "",
-              timestamp: entry.timestamp ?? 0,
-              segment,
-              confidence: entry.confidence ?? null,
-              iterationTokens,
-              asi: entry.asi ?? undefined,
-            });
-
-            if (typeof iterationTokens === "number" && iterationTokens > 0) {
-              runtime.iterationTokenHistory.push(iterationTokens);
-            }
-
-            // Register secondary metrics
-            for (const name of Object.keys(entry.metrics ?? {})) {
-              if (!state.secondaryMetrics.find((m) => m.name === name)) {
-                let unit = "";
-                if (name.endsWith("µs")) unit = "µs";
-                else if (name.endsWith("_ms")) unit = "ms";
-                else if (name.endsWith("_s") || name.endsWith("_sec")) unit = "s";
-                else if (name.endsWith("_kb")) unit = "kb";
-                else if (name.endsWith("_mb")) unit = "mb";
-                state.secondaryMetrics.push({ name, unit });
-              }
-            }
-          } catch {
-            // Skip malformed lines
-          }
-        }
         if (state.results.length > 0) {
           loadedFromJsonl = true;
           state.bestMetric = findBaselineMetric(state.results, state.currentSegment);
@@ -1078,7 +1249,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     state.maxExperiments = readMaxExperiments(ctx.cwd);
 
     // Auto-enter autoresearch mode only when a persisted experiment log exists
-    runtime.autoresearchMode = fs.existsSync(path.join(workDir, "autoresearch.jsonl"));
+    runtime.autoresearchMode = fs.existsSync(autoresearchJsonlPath(workDir));
 
     updateWidget(ctx);
   };
@@ -1095,165 +1266,205 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         return;
       }
 
-      ctx.ui.setWidget("autoresearch", (_tui, theme) => {
-        const parts = [
-          theme.fg("accent", "🔬"),
-          theme.fg("warning", " running…"),
-        ];
-
-        if (state.name) {
-          parts.push(theme.fg("dim", ` │ ${state.name}`));
-        }
-
-        parts.push(theme.fg("dim", ` │ ${runtime.runningExperiment.command}`));
-        parts.push(theme.fg("dim", "  (waiting for first logged result)"));
-
-        return new Text(parts.join(""), 0, 0);
-      });
+      ctx.ui.setWidget("autoresearch", (tui, theme) => ({
+        render(width: number): string[] {
+          const safeWidth = Math.max(1, width || getTuiSize(tui).width);
+          const runningLine = joinPartsToWidth(
+            [
+              theme.fg("accent", "🔬"),
+              theme.fg("warning", " running…"),
+              state.name ? theme.fg("dim", ` │ ${state.name}`) : "",
+              theme.fg("dim", ` │ ${runtime.runningExperiment?.command ?? ""}`),
+              theme.fg("dim", " │ waiting for first logged result"),
+            ],
+            safeWidth
+          );
+          return [runningLine];
+        },
+        invalidate(): void {},
+      }));
       return;
     }
 
     if (runtime.dashboardExpanded) {
       // Expanded: full dashboard table rendered as widget
-      ctx.ui.setWidget("autoresearch", (_tui, theme) => {
-        const width = process.stdout.columns || 120;
-        const lines: string[] = [];
+      ctx.ui.setWidget("autoresearch", (tui, theme) => ({
+        render(width: number): string[] {
+          const safeWidth = Math.max(1, width || getTuiSize(tui).width);
+          const title = truncateDisplayText(
+            `🔬 autoresearch${state.name ? `: ${state.name}` : ""}`,
+            Math.max(0, safeWidth - 5)
+          );
+          const fillLen = Math.max(0, safeWidth - 3 - 1 - visibleWidth(title) - 1);
+          const rows = safeWidth < 95 ? 4 : 6;
 
-        const hintText = " ctrl+x collapse • ctrl+shift+x fullscreen ";
-        const labelPrefix = "🔬 autoresearch";
-        const nameStr = state.name ? `: ${state.name}` : "";
-        // 3 leading dashes + space + label + space + fill + hint
-        const maxLabelLen = width - 3 - 2 - hintText.length - 1;
-        let label = labelPrefix + nameStr;
-        if (label.length > maxLabelLen) {
-          label = label.slice(0, maxLabelLen - 1) + "…";
-        }
-        const fillLen = Math.max(0, width - 3 - 1 - label.length - 1 - hintText.length);
-        lines.push(
-          truncateToWidth(
-            theme.fg("borderMuted", "───") +
-              theme.fg("accent", " " + label + " ") +
-              theme.fg("borderMuted", "─".repeat(fillLen)) +
-              theme.fg("dim", hintText),
-            width
-          )
-        );
-
-        lines.push(...renderDashboardLines(state, width, theme));
-
-        return new Text(lines.join("\n"), 0, 0);
-      });
+          return [
+            truncateToWidth(
+              theme.fg("borderMuted", "───") +
+                theme.fg("accent", ` ${title} `) +
+                theme.fg("borderMuted", "─".repeat(fillLen)),
+              safeWidth,
+              "…",
+              true
+            ),
+            ...renderDashboardLines(
+              state,
+              safeWidth,
+              theme,
+              rows,
+              "ctrl+shift+t collapse • ctrl+shift+f fullscreen"
+            ),
+          ];
+        },
+        invalidate(): void {},
+      }));
     } else {
       // Collapsed: compact one-liner — compute everything inside render
-      ctx.ui.setWidget("autoresearch", (_tui, theme) => {
-        const cur = currentResults(state.results, state.currentSegment);
-        const kept = cur.filter((r) => r.status === "keep").length;
-        const crashed = cur.filter((r) => r.status === "crash").length;
-        const checksFailed = cur.filter((r) => r.status === "checks_failed").length;
-        const baseline = state.bestMetric;
-        const baselineSec = findBaselineSecondary(state.results, state.currentSegment, state.secondaryMetrics);
+      ctx.ui.setWidget("autoresearch", (tui, theme) => ({
+        render(width: number): string[] {
+          const safeWidth = Math.max(1, width || getTuiSize(tui).width);
+          const cur = currentResults(state.results, state.currentSegment);
+          const kept = cur.filter((r) => r.status === "keep").length;
+          const crashed = cur.filter((r) => r.status === "crash").length;
+          const checksFailed = cur.filter((r) => r.status === "checks_failed").length;
+          const baseline = state.bestMetric;
+          const baselineSec = findBaselineSecondary(
+            state.results,
+            state.currentSegment,
+            state.secondaryMetrics
+          );
 
-        // Find best kept primary metric, its secondary values, and run number
-        let bestPrimary: number | null = null;
-        let bestSec: Record<string, number> = {};
-        let bestRunNum = 0;
-        for (let i = state.results.length - 1; i >= 0; i--) {
-          const r = state.results[i];
-          if (r.segment !== state.currentSegment) continue;
-          if (r.status === "keep" && r.metric > 0) {
-            if (bestPrimary === null || isBetter(r.metric, bestPrimary, state.bestDirection)) {
-              bestPrimary = r.metric;
-              bestSec = r.metrics ?? {};
-              bestRunNum = i + 1;
+          let bestPrimary: number | null = null;
+          let bestSec: Record<string, number> = {};
+          let bestRunNum = 0;
+          for (let i = state.results.length - 1; i >= 0; i--) {
+            const r = state.results[i];
+            if (r.segment !== state.currentSegment) continue;
+            if (r.status === "keep" && r.metric > 0) {
+              if (bestPrimary === null || isBetter(r.metric, bestPrimary, state.bestDirection)) {
+                bestPrimary = r.metric;
+                bestSec = r.metrics ?? {};
+                bestRunNum = i + 1;
+              }
             }
           }
-        }
 
-        const displayVal = bestPrimary ?? baseline;
+          const displayVal = bestPrimary ?? baseline;
+          const phaseTag = runtime.phase === 'running'
+            ? theme.fg("warning", " ⏳running")
+            : runtime.phase === 'pending_log'
+              ? theme.fg("error", " ⏸️pending_log")
+              : "";
+          const essential = [
+            theme.fg("accent", "🔬"),
+            phaseTag,
+            theme.fg("muted", ` ${state.results.length} runs`),
+            theme.fg("success", ` ${kept} kept`),
+            theme.fg("dim", " │ "),
+            theme.fg(
+              "warning",
+              theme.bold(`★ ${state.metricName}: ${formatNum(displayVal, state.metricUnit)}`)
+            ),
+            bestRunNum > 0 ? theme.fg("dim", ` #${bestRunNum}`) : "",
+          ];
 
-        // Phase indicator
-        const phaseTag = runtime.phase === 'running'
-          ? theme.fg("warning", " ⏳running")
-          : runtime.phase === 'pending_log'
-            ? theme.fg("error", " ⏸️pending_log")
-            : "";
+          const optional: string[] = [];
+          if (crashed > 0) optional.push(theme.fg("error", ` ${crashed}💥`));
+          if (checksFailed > 0) optional.push(theme.fg("error", ` ${checksFailed}⚠`));
 
-        const parts = [
-          theme.fg("accent", "🔬"),
-          phaseTag,
-          theme.fg("muted", ` ${state.results.length} runs`),
-          theme.fg("success", ` ${kept} kept`),
-          crashed > 0 ? theme.fg("error", ` ${crashed}💥`) : "",
-          checksFailed > 0 ? theme.fg("error", ` ${checksFailed}⚠`) : "",
-          theme.fg("dim", " │ "),
-          theme.fg("warning", theme.bold(`★ ${state.metricName}: ${formatNum(displayVal, state.metricUnit)}`)),
-          bestRunNum > 0 ? theme.fg("dim", ` #${bestRunNum}`) : "",
-        ];
+          if (baseline !== null && bestPrimary !== null && baseline !== 0 && bestPrimary !== baseline) {
+            const pct = ((bestPrimary - baseline) / baseline) * 100;
+            const sign = pct > 0 ? "+" : "";
+            const deltaColor = isBetter(bestPrimary, baseline, state.bestDirection)
+              ? "success"
+              : "error";
+            optional.push(theme.fg(deltaColor, ` (${sign}${pct.toFixed(1)}%)`));
+          }
 
-        // Show delta % vs baseline for primary
-        if (baseline !== null && bestPrimary !== null && baseline !== 0 && bestPrimary !== baseline) {
-          const pct = ((bestPrimary - baseline) / baseline) * 100;
-          const sign = pct > 0 ? "+" : "";
-          const deltaColor = isBetter(bestPrimary, baseline, state.bestDirection) ? "success" : "error";
-          parts.push(theme.fg(deltaColor, ` (${sign}${pct.toFixed(1)}%)`));
-        }
+          if (state.confidence !== null) {
+            const confStr = state.confidence.toFixed(1);
+            const confColor: Parameters<typeof theme.fg>[0] = state.confidence >= 2.0 ? "success" : state.confidence >= 1.0 ? "warning" : "error";
+            optional.push(theme.fg("dim", " │ "));
+            optional.push(theme.fg(confColor, `conf: ${confStr}×`));
+          }
 
-        // Show confidence score
-        if (state.confidence !== null) {
-          const confStr = state.confidence.toFixed(1);
-          const confColor: Parameters<typeof theme.fg>[0] = state.confidence >= 2.0 ? "success" : state.confidence >= 1.0 ? "warning" : "error";
-          parts.push(theme.fg("dim", " │ "));
-          parts.push(theme.fg(confColor, `conf: ${confStr}×`));
-        }
-
-        // Show secondary metrics with delta %
-        if (state.secondaryMetrics.length > 0) {
-          for (const sm of state.secondaryMetrics) {
-            const val = bestSec[sm.name];
-            const bv = baselineSec[sm.name];
-            if (val !== undefined) {
-              parts.push(theme.fg("dim", "  "));
-              // Color value and delta separately to avoid color bleed
-              parts.push(theme.fg("muted", `${sm.name}: ${formatNum(val, sm.unit)}`));
+          if (state.secondaryMetrics.length > 0) {
+            for (const sm of state.secondaryMetrics) {
+              const val = bestSec[sm.name];
+              const bv = baselineSec[sm.name];
+              if (val === undefined) continue;
+              let secText = `${sm.name}: ${formatNum(val, sm.unit)}`;
               if (bv !== undefined && bv !== 0 && val !== bv) {
                 const p = ((val - bv) / bv) * 100;
                 const s = p > 0 ? "+" : "";
                 const c = val <= bv ? "success" : "error";
-                parts.push(theme.fg(c, ` ${s}${p.toFixed(1)}%`));
+                secText += theme.fg(c, ` ${s}${p.toFixed(1)}%`);
               }
+              optional.push(theme.fg("dim", "  "));
+              optional.push(theme.fg("muted", secText));
+              break;
             }
           }
-        }
 
-        if (state.name) {
-          parts.push(theme.fg("dim", ` │ ${state.name}`));
-        }
+          if (state.name) optional.push(theme.fg("dim", ` │ ${state.name}`));
 
-        parts.push(theme.fg("dim", "  (ctrl+x expand • ctrl+shift+x fullscreen)"));
-
-        return new Text(parts.join(""), 0, 0);
-      });
+          const left = [...essential, ...optional].join("");
+          return [
+            appendRightAlignedAdaptiveHint(left, safeWidth, theme, [
+              "ctrl+shift+t expand • ctrl+shift+f fullscreen",
+              "ctrl+shift+t expand • full: ctrl+shift+f",
+              "ctrl+shift+t • ctrl+shift+f",
+            ]),
+          ];
+        },
+        invalidate(): void {},
+      }));
     }
   };
 
   pi.on("session_start", async (_e, ctx) => reconstructState(ctx));
-  pi.on("session_switch", async (_e, ctx) => reconstructState(ctx));
-  pi.on("session_fork", async (_e, ctx) => reconstructState(ctx));
   pi.on("session_tree", async (_e, ctx) => reconstructState(ctx));
   pi.on("session_before_switch", async () => {
     clearOverlay();
   });
   pi.on("session_shutdown", async (_e, ctx) => {
     clearSessionUi(ctx);
+    cancelPendingResume(getRuntime(ctx));
     runtimeStore.clear(getSessionKey(ctx));
+    stopDashboardServer();
   });
 
-  // Reset per-session experiment counter when agent starts
   pi.on("agent_start", async (_event, ctx) => {
-    getRuntime(ctx).experimentsThisSession = 0;
+    const runtime = getRuntime(ctx);
+    runtime.experimentsThisSession = 0;
+    pausePendingResume(runtime);
   });
 
-  // Clear running experiment state when agent stops; check ideas file for continuation
+  const ensurePendingResume = (
+    ctx: ExtensionContext,
+    gate: (runtime: AutoresearchRuntime) => boolean,
+  ): void => {
+    const runtime = getRuntime(ctx);
+    if (hasPendingResume(runtime)) {
+      reschedulePendingResume(ctx, runtime);
+      return;
+    }
+    if (!gate(runtime)) return;
+    if (hasReachedAutoResumeLimit(runtime)) {
+      notifyAutoResumeLimitReached(ctx);
+      return;
+    }
+    schedulePendingResume(ctx, runtime, composeResumeMessage(ctx));
+  };
+
+  pi.on("session_before_compact", async (_event, ctx) => {
+    pausePendingResume(getRuntime(ctx));
+  });
+
+  pi.on("session_compact", async (_event, ctx) => {
+    ensurePendingResume(ctx, shouldAutoResumeAfterCompact);
+  });
+
   pi.on("agent_end", async (_event, ctx) => {
     const runtime = getRuntime(ctx);
 
@@ -1274,7 +1485,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         timestamp: Date.now(),
         segment: state.currentSegment,
         confidence: null,
-        iterationTokens: lastIterationTokens(runtime),
         asi: { auto_saved: true, reason: 'agent_end_without_log', crashed: result.crashed },
       };
       state.results.push(experiment);
@@ -1296,39 +1506,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     runtime.lastRunResult = null;
     runtime.runningExperiment = null;
     if (overlayTui) overlayTui.requestRender();
-
-    if (!runtime.autoresearchMode) return;
-
-    // Don't auto-resume if no experiments ran this session (user likely stopped manually)
-    if (runtime.experimentsThisSession === 0) return;
-
-    // Rate-limit auto-resume to once every 5 minutes
-    const now = Date.now();
-    if (now - runtime.lastAutoResumeTime < 5 * 60 * 1000) return;
-    runtime.lastAutoResumeTime = now;
-
-    if (runtime.autoResumeTurns >= MAX_AUTORESUME_TURNS) {
-      ctx.ui.notify(
-        `Autoresearch auto-resume limit reached (${MAX_AUTORESUME_TURNS} turns)`,
-        "info"
-      );
-      return;
-    }
-
-    // Auto-continue: send a message to resume the loop
-    // The agent reads autoresearch.md on startup which has all context
-    const workDir = resolveWorkDir(ctx.cwd);
-    const ideasPath = path.join(workDir, "autoresearch.ideas.md");
-    const hasIdeas = fs.existsSync(ideasPath);
-
-    let resumeMsg = "Autoresearch loop ended (likely context limit). Resume the experiment loop — read autoresearch.md and git log for context.";
-    if (hasIdeas) {
-      resumeMsg += " Check autoresearch.ideas.md for promising paths to explore. Prune stale/tried ideas.";
-    }
-    resumeMsg += ` ${BENCHMARK_GUARDRAIL}`;
-
-    runtime.autoResumeTurns++;
-    pi.sendUserMessage(resumeMsg);
+    ensurePendingResume(ctx, shouldAutoResumeAfterTurn);
   });
 
   // When in autoresearch mode, add a static note to the system prompt.
@@ -1338,11 +1516,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     if (!runtime.autoresearchMode) return;
 
     const workDir = resolveWorkDir(ctx.cwd);
-    const mdPath = path.join(workDir, "autoresearch.md");
-    const ideasPath = path.join(workDir, "autoresearch.ideas.md");
+    const mdPath = autoresearchMdPath(workDir);
+    const ideasPath = autoresearchIdeasPath(workDir);
     const hasIdeas = fs.existsSync(ideasPath);
 
-    const checksPath = path.join(workDir, "autoresearch.checks.sh");
+    const checksPath = autoresearchChecksPath(workDir);
     const hasChecks = fs.existsSync(checksPath);
 
     let extra =
@@ -1427,7 +1605,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // Write config header to jsonl (append for re-init, create for first)
       const workDir = resolveWorkDir(ctx.cwd);
       try {
-        const jsonlPath = path.join(workDir, "autoresearch.jsonl");
+        const jsonlPath = autoresearchJsonlPath(workDir);
         const config = JSON.stringify({
           type: "config",
           name: state.name,
@@ -1440,6 +1618,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         } else {
           fs.writeFileSync(jsonlPath, config + "\n");
         }
+        broadcastDashboardUpdate(workDir);
       } catch (e) {
         return {
           content: [{
@@ -1450,9 +1629,20 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         };
       }
 
+      const wasInactive = !runtime.autoresearchMode;
       runtime.autoresearchMode = true;
-      runtime.iterationStartTokens = ctx.getContextUsage()?.tokens ?? null;
       updateWidget(ctx);
+
+      if (wasInactive) {
+        const steer = await fireHook({
+          event: "before",
+          cwd: workDir,
+          next_run: state.results.length + 1,
+          last_run: readLastRun(workDir),
+          session: buildSessionSnapshot(state),
+        });
+        if (steer) pi.sendUserMessage(steer, { deliverAs: "steer" });
+      }
 
       const reinitNote = isReinit ? " (re-initialized — previous results archived, new baseline needed)" : "";
       const limitNote = state.maxExperiments !== null ? `\nMax iterations: ${state.maxExperiments} (from autoresearch.config.json)` : "";
@@ -1539,7 +1729,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const timeout = (params.timeout_seconds ?? 600) * 1000;
 
       // Guard: if autoresearch.sh exists, only allow running it
-      const autoresearchShPath = path.join(workDir, "autoresearch.sh");
+      const autoresearchShPath = autoresearchScriptPath(workDir);
       if (fs.existsSync(autoresearchShPath) && !isAutoresearchShCommand(params.command)) {
         return {
           content: [{
@@ -1562,16 +1752,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         };
       }
 
-      advanceIterationTracking(runtime, ctx);
-      if (isContextExhausted(runtime, ctx)) {
-        runtime.autoresearchMode = false;
-        ctx.abort();
-        return {
-          content: [{ type: "text", text: "🛑 Context window almost full. Start a new pi session to continue — all progress is saved." }],
-          details: {},
-        };
-      }
-
+      // Pi handles compaction; persisted files allow autoresearch to resume after context rotation.
       runtime.phase = 'running';
       runtime.runningExperiment = { startedAt: Date.now(), command: params.command };
       updateWidget(ctx);
@@ -1758,7 +1939,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       let checksOutput = "";
       let checksDuration = 0;
 
-      const checksPath = path.join(workDir, "autoresearch.checks.sh");
+      const checksPath = autoresearchChecksPath(workDir);
       if (benchmarkPassed && fs.existsSync(checksPath)) {
         const checksTimeout = (params.checks_timeout_seconds ?? 300) * 1000;
         const ct0 = Date.now();
@@ -2122,8 +2303,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         ? params.asi as ASI
         : undefined;
 
-      const iterationTokens = lastIterationTokens(runtime);
-
       const experiment: ExperimentResult = {
         commit: params.commit.slice(0, 7),
         metric: params.metric,
@@ -2133,7 +2312,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         timestamp: Date.now(),
         segment: state.currentSegment,
         confidence: null,
-        iterationTokens,
         asi: mergedASI,
       };
 
@@ -2270,33 +2448,43 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }
       }
 
-      // Persist to autoresearch.jsonl (always, regardless of status)
+      const jsonlEntry: Record<string, unknown> = {
+        run: state.results.length,
+        ...experiment,
+      };
+      if (!mergedASI) delete jsonlEntry.asi;
+      const jsonlLine = JSON.stringify(jsonlEntry);
+
       try {
-        const jsonlPath = path.join(workDir, "autoresearch.jsonl");
-        const jsonlEntry: Record<string, unknown> = {
-          run: state.results.length,
-          ...experiment,
-        };
-        // Only write asi if present (keep lines compact when no ASI)
-        if (!mergedASI) delete jsonlEntry.asi;
-        fs.appendFileSync(jsonlPath, JSON.stringify(jsonlEntry) + "\n");
+        fs.appendFileSync(autoresearchJsonlPath(workDir), jsonlLine + "\n");
+        broadcastDashboardUpdate(workDir);
       } catch (e) {
         text += `\n⚠️ Failed to write autoresearch.jsonl: ${e instanceof Error ? e.message : String(e)}`;
       }
 
-      // Auto-revert on discard/crash/checks_failed — revert all files except autoresearch session files
       if (params.status !== "keep") {
         try {
-          const protectedFiles = ["autoresearch.jsonl", "autoresearch.md", "autoresearch.ideas.md", "autoresearch.sh", "autoresearch.checks.sh"];
-          const stageCmd = protectedFiles.map((f) => `git add "${path.join(workDir, f)}" 2>/dev/null || true`).join("; ");
-          await pi.exec("bash", ["-c", `${stageCmd}; git checkout -- .; git clean -fd 2>/dev/null`], { cwd: workDir, timeout: 10000 });
+          const revertScript = `
+            git checkout -- . ':(exclude,glob)**/autoresearch.*' ':(exclude,glob)**/autoresearch.*/**'
+            git clean -fd -e 'autoresearch.*' -e '**/autoresearch.*/**' 2>/dev/null
+          `;
+          await pi.exec("bash", ["-c", revertScript], { cwd: workDir, timeout: 10000 });
           text += `\n📝 Git: reverted changes (${params.status}) — autoresearch files preserved`;
         } catch (e) {
           text += `\n⚠️ Git revert failed: ${e instanceof Error ? e.message : String(e)}`;
         }
       }
 
+      const afterSteer = await fireHook({
+        event: "after",
+        cwd: workDir,
+        run_entry: jsonlEntry,
+        session: buildSessionSnapshot(state),
+      });
+      if (afterSteer) pi.sendUserMessage(afterSteer, { deliverAs: "steer" });
+
       // ── State machine: pending_log → idle ──
+
       const wallClockSeconds = runtime.lastRunDuration;
       runtime.phase = 'idle';
       runtime.lastRunResult = null;
@@ -2304,13 +2492,20 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       runtime.lastRunChecks = null;
       runtime.lastRunDuration = null;
 
-
-      // Check if max experiments limit reached
       const limitReached = state.maxExperiments !== null && segmentCount >= state.maxExperiments;
       if (limitReached) {
         text += `\n\n🛑 Maximum experiments reached (${state.maxExperiments}). STOP the experiment loop now.`;
         runtime.autoresearchMode = false;
         ctx.abort();
+      } else if (runtime.autoresearchMode) {
+        const beforeSteer = await fireHook({
+          event: "before",
+          cwd: workDir,
+          next_run: state.results.length + 1,
+          last_run: jsonlEntry,
+          session: buildSessionSnapshot(state),
+        });
+        if (beforeSteer) pi.sendUserMessage(beforeSteer, { deliverAs: "steer" });
       }
 
       updateWidget(ctx);
@@ -2405,16 +2600,16 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   });
 
   // -----------------------------------------------------------------------
-  // Ctrl+X — toggle dashboard expand/collapse
+  // Ctrl+Shift+T — toggle dashboard expand/collapse
   // -----------------------------------------------------------------------
 
-  pi.registerShortcut("ctrl+x", {
+  pi.registerShortcut("ctrl+shift+t", {
     description: "Toggle autoresearch dashboard",
     handler: async (ctx) => {
       const runtime = getRuntime(ctx);
       const state = runtime.state;
       if (state.results.length === 0) {
-        if (!runtime.autoresearchMode && !fs.existsSync(path.join(resolveWorkDir(ctx.cwd), "autoresearch.md"))) {
+        if (!runtime.autoresearchMode && !fs.existsSync(autoresearchMdPath(resolveWorkDir(ctx.cwd)))) {
           ctx.ui.notify("No experiments yet — run /autoresearch to get started", "info");
         } else {
           ctx.ui.notify("No experiments yet", "info");
@@ -2427,10 +2622,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   });
 
   // -----------------------------------------------------------------------
-  // Ctrl+Shift+X — fullscreen scrollable dashboard overlay
+  // Ctrl+Shift+F — fullscreen scrollable dashboard overlay
   // -----------------------------------------------------------------------
 
-  pi.registerShortcut("ctrl+shift+x", {
+  pi.registerShortcut("ctrl+shift+f", {
     description: "Fullscreen autoresearch dashboard",
     handler: async (ctx) => {
       const runtime = getRuntime(ctx);
@@ -2443,110 +2638,84 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       await ctx.ui.custom<void>(
         (tui, theme, _kb, done) => {
           let scrollOffset = 0;
-          // Store tui ref so run_experiment can trigger re-renders
+          let lastViewportRows = 8;
+          let lastTotalRows = 0;
           overlayTui = tui;
 
-          // Start spinner interval for elapsed time animation
           spinnerInterval = setInterval(() => {
             spinnerFrame = (spinnerFrame + 1) % SPINNER.length;
             if (runtime.runningExperiment) tui.requestRender();
           }, 80);
 
-          const computeViewportRows = () => {
-            const termH = process.stdout.rows || 40;
-            const overlayMaxH = Math.floor(termH * 0.9);
-            return Math.max(4, overlayMaxH - 4);
+          const buildOverlayContent = (renderWidth: number): string[] => {
+            const content = renderDashboardLines(state, renderWidth, theme, 0);
+            if (runtime.runningExperiment) {
+              const elapsed = formatElapsed(Date.now() - runtime.runningExperiment.startedAt);
+              const frame = SPINNER[spinnerFrame % SPINNER.length];
+              const nextIdx = state.results.length + 1;
+              content.push(
+                truncateToWidth(
+                  `  ${theme.fg("dim", String(nextIdx).padEnd(3))}` +
+                    theme.fg("warning", `${frame} running… ${elapsed}`),
+                  renderWidth,
+                  "…",
+                  true
+                )
+              );
+            }
+            return content;
           };
 
           return {
             render(width: number): string[] {
-              const border = (s: string) => theme.fg("accent", s);
-
-              // Inner content width: │ + space + content + space + │
-              const innerWidth = Math.max(10, width - 4);
-              const content = renderDashboardLines(state, innerWidth, theme, 0);
-
-              // Add running experiment as next row in the list
-              if (runtime.runningExperiment) {
-                const elapsed = formatElapsed(Date.now() - runtime.runningExperiment.startedAt);
-                const frame = SPINNER[spinnerFrame % SPINNER.length];
-                const nextIdx = state.results.length + 1;
-                content.push(
-                  truncateToWidth(
-                    `  ${theme.fg("dim", String(nextIdx).padEnd(3))}` +
-                    theme.fg("warning", `${frame} running… ${elapsed}`),
-                    innerWidth
-                  )
-                );
-              }
+              const { height } = getTuiSize(tui);
+              const safeWidth = Math.max(1, width || getTuiSize(tui).width);
+              const viewportRows = Math.max(4, height - 4);
+              const content = buildOverlayContent(safeWidth);
 
               const totalRows = content.length;
-              const viewportRows = computeViewportRows();
-
-              // Clamp scroll
               const maxScroll = Math.max(0, totalRows - viewportRows);
-              if (scrollOffset > maxScroll) scrollOffset = maxScroll;
-              if (scrollOffset < 0) scrollOffset = 0;
+              scrollOffset = clamp(scrollOffset, 0, maxScroll);
+              lastViewportRows = viewportRows;
+              lastTotalRows = totalRows;
 
               const out: string[] = [];
 
-              // Top border with embedded title: ┌── 🔬 autoresearch: name ──────┐
-              const titlePrefix = "🔬 autoresearch";
-              const nameStr = state.name ? `: ${state.name}` : "";
-              let title = titlePrefix + nameStr;
-              const titleVisW = visibleWidth(title);
-              // Budget: ┌── (3) + space (1) + title + space (1) + fill + ┐ (1) = width
-              const maxTitleVisW = width - 6;
-              if (titleVisW > maxTitleVisW) {
-                title = truncateToWidth(title, Math.max(5, maxTitleVisW));
-              }
-              const titleActualVisW = visibleWidth(title);
-              const topFillLen = Math.max(0, width - 6 - titleActualVisW);
+              const title = truncateDisplayText(
+                `🔬 autoresearch${state.name ? `: ${state.name}` : ""}`,
+                Math.max(0, safeWidth - 5)
+              );
+              const fillLen = Math.max(0, safeWidth - 3 - 1 - visibleWidth(title) - 1);
+
               out.push(
                 truncateToWidth(
-                  border("┌──") +
-                  border(" " + title + " ") +
-                  border("─".repeat(topFillLen) + "┐"),
-                  width
+                  theme.fg("borderMuted", "───") +
+                    theme.fg("accent", ` ${title} `) +
+                    theme.fg("borderMuted", "─".repeat(fillLen)),
+                  safeWidth,
+                  "…",
+                  true
                 )
               );
 
-              // Content rows with side borders: │ content │
               const visible = content.slice(scrollOffset, scrollOffset + viewportRows);
-              for (const line of visible) {
-                const lineVisW = visibleWidth(line);
-                const padding = Math.max(0, innerWidth - lineVisW);
-                out.push(
-                  truncateToWidth(
-                    border("│") + " " + line + " ".repeat(padding) + " " + border("│"),
-                    width
-                  )
-                );
-              }
-              // Fill remaining viewport with empty bordered rows
-              for (let i = visible.length; i < viewportRows; i++) {
-                out.push(
-                  truncateToWidth(
-                    border("│") + " ".repeat(width - 2) + border("│"),
-                    width
-                  )
-                );
-              }
+              for (const line of visible) out.push(truncateToWidth(line, safeWidth, "…", true));
+              for (let i = visible.length; i < viewportRows; i++) out.push("");
 
-              // Bottom border with help text: └─────── ↑↓/j/k scroll • esc close ──┘
               const scrollInfo = totalRows > viewportRows
                 ? ` ${scrollOffset + 1}-${Math.min(scrollOffset + viewportRows, totalRows)}/${totalRows}`
                 : "";
-              const helpText = `↑↓/j/k scroll • esc close${scrollInfo}`;
-              const helpVisW = visibleWidth(helpText);
-              // Budget: └ (1) + fill + space (1) + help + space (1) + ──┘ (3) = width
-              const bottomFillLen = Math.max(0, width - 6 - helpVisW);
+              const helpText = safeWidth >= 85
+                ? ` ↑↓/j/k scroll • pgup/pgdn • g/G • esc close${scrollInfo} `
+                : ` j/k scroll • esc close${scrollInfo} `;
+              const footFill = Math.max(0, safeWidth - visibleWidth(helpText));
+
               out.push(
                 truncateToWidth(
-                  border("└" + "─".repeat(bottomFillLen)) +
-                  theme.fg("dim", " " + helpText + " ") +
-                  border("──┘"),
-                  width
+                  theme.fg("borderMuted", "─".repeat(footFill)) + theme.fg("dim", helpText),
+                  safeWidth,
+                  "…",
+                  true
                 )
               );
 
@@ -2554,10 +2723,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             },
 
             handleInput(data: string): void {
-              const viewportRows = computeViewportRows();
-              const actualContent = renderDashboardLines(state, process.stdout.columns || 120, theme, 0);
-              const totalRows = actualContent.length + (runtime.runningExperiment ? 1 : 0);
-              const maxScroll = Math.max(0, totalRows - viewportRows);
+              const maxScroll = Math.max(0, lastTotalRows - lastViewportRows);
 
               if (matchesKey(data, "escape") || data === "q") {
                 done(undefined);
@@ -2568,9 +2734,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
               } else if (matchesKey(data, "down") || data === "j") {
                 scrollOffset = Math.min(maxScroll, scrollOffset + 1);
               } else if (matchesKey(data, "pageUp") || data === "u") {
-                scrollOffset = Math.max(0, scrollOffset - viewportRows);
+                scrollOffset = Math.max(0, scrollOffset - lastViewportRows);
               } else if (matchesKey(data, "pageDown") || data === "d") {
-                scrollOffset = Math.min(maxScroll, scrollOffset + viewportRows);
+                scrollOffset = Math.min(maxScroll, scrollOffset + lastViewportRows);
               } else if (data === "g") {
                 scrollOffset = 0;
               } else if (data === "G") {
@@ -2599,6 +2765,228 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   });
 
   // -----------------------------------------------------------------------
+  // Export: local live dashboard
+  // -----------------------------------------------------------------------
+
+  const TITLE_PLACEHOLDER = "__AUTORESEARCH_TITLE__";
+  const LOGO_PLACEHOLDER = "__AUTORESEARCH_LOGO__";
+
+  let cachedPackageRoot: string | null = null;
+
+  function packageRoot(): string {
+    if (cachedPackageRoot) return cachedPackageRoot;
+    const extensionDir = fs.realpathSync(path.dirname(fileURLToPath(import.meta.url)));
+    cachedPackageRoot = path.resolve(extensionDir, "../..");
+    return cachedPackageRoot;
+  }
+
+  function templatePath(): string {
+    return path.join(packageRoot(), "assets/template.html");
+  }
+
+  function readTemplate(): string {
+    return fs.readFileSync(templatePath(), "utf-8");
+  }
+
+  let cachedLogoDataUrl: string | null = null;
+
+  function logoDataUrl(): string {
+    if (cachedLogoDataUrl) return cachedLogoDataUrl;
+    const logoPath = path.join(packageRoot(), "assets/logo.webp");
+    const bytes = fs.readFileSync(logoPath);
+    cachedLogoDataUrl = `data:image/webp;base64,${bytes.toString("base64")}`;
+    return cachedLogoDataUrl;
+  }
+
+  function readJsonlContent(workDir: string): string {
+    return fs.readFileSync(autoresearchJsonlPath(workDir), "utf-8").trim();
+  }
+
+  function escapeHtml(text: string): string {
+    return text
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/\"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
+  function injectDataIntoTemplate(template: string, title: string): string {
+    const escapedTitle = escapeHtml(title);
+    return template.replace(TITLE_PLACEHOLDER, () => escapedTitle);
+  }
+
+  let dashboardServer: Server | null = null;
+  let dashboardServerPort: number | null = null;
+  let dashboardServerWorkDir: string | null = null;
+  let dashboardServerHtmlPath: string | null = null;
+  const dashboardSseClients = new Set<ServerResponse>();
+
+  function openInBrowser(url: string): void {
+    if (process.platform === "win32") {
+      spawn("cmd", ["/c", "start", "", url], {
+        detached: true,
+        shell: true,
+        stdio: "ignore",
+      }).unref();
+      return;
+    }
+
+    const openCmd = process.platform === "darwin" ? "open" : "xdg-open";
+    spawn(openCmd, [url], { detached: true, stdio: "ignore" }).unref();
+  }
+
+  function stopDashboardServer(): void {
+    for (const client of dashboardSseClients) {
+      try { client.end(); } catch { /* ignore */ }
+    }
+    dashboardSseClients.clear();
+
+    if (dashboardServer) {
+      try { dashboardServer.close(); } catch { /* ignore */ }
+    }
+
+    dashboardServer = null;
+    dashboardServerPort = null;
+    dashboardServerWorkDir = null;
+    dashboardServerHtmlPath = null;
+  }
+
+  function writeDashboardFile(workDir: string): string {
+    const jsonlContent = readJsonlContent(workDir);
+    const sessionName = extractAutoresearchSessionName(jsonlContent);
+    const html = injectDataIntoTemplate(readTemplate(), sessionName)
+      .replace(LOGO_PLACEHOLDER, logoDataUrl());
+    const exportDir = fs.mkdtempSync(path.join(tmpdir(), "pi-autoresearch-dashboard-"));
+    const dest = path.join(exportDir, "index.html");
+    fs.writeFileSync(dest, html);
+    return dest;
+  }
+
+  const CONTENT_TYPES: Record<string, string> = {
+    ".html": "text/html; charset=utf-8",
+    ".jsonl": "text/plain; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".png": "image/png",
+    ".webp": "image/webp",
+  };
+
+  function fileContentType(filePath: string): string {
+    const ext = path.extname(filePath).toLowerCase();
+    return CONTENT_TYPES[ext] ?? "application/octet-stream";
+  }
+
+  function resolveServedFile(workDir: string, requestPath: string): string | null {
+    if (requestPath === "/") return dashboardServerHtmlPath;
+    if (requestPath === "/autoresearch.jsonl") return autoresearchJsonlPath(workDir);
+    return null;
+  }
+
+  function registerSseClient(res: ServerResponse): void {
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    });
+    res.write("retry: 1000\n\n");
+    dashboardSseClients.add(res);
+    res.on("close", () => dashboardSseClients.delete(res));
+  }
+
+  function broadcastDashboardUpdate(workDir: string): void {
+    if (!dashboardServer || dashboardServerWorkDir !== workDir) return;
+    for (const res of dashboardSseClients) {
+      try {
+        res.write("event: jsonl-updated\n");
+        res.write(`data: ${Date.now()}\n\n`);
+      } catch {
+        dashboardSseClients.delete(res);
+      }
+    }
+  }
+
+  function startStaticServer(workDir: string, dashboardHtmlPath: string): Promise<number> {
+    return new Promise((resolve, reject) => {
+      const resolvedWorkDir = path.resolve(workDir);
+      const resolvedDashboardHtmlPath = path.resolve(dashboardHtmlPath);
+
+      if (dashboardServer && dashboardServerWorkDir === resolvedWorkDir && dashboardServerPort) {
+        dashboardServerHtmlPath = resolvedDashboardHtmlPath;
+        resolve(dashboardServerPort);
+        return;
+      }
+
+      stopDashboardServer();
+      dashboardServerHtmlPath = resolvedDashboardHtmlPath;
+
+      const server = createServer((req, res) => {
+        const url = new URL(req.url ?? "/", "http://127.0.0.1");
+
+        if (url.pathname === "/events") {
+          registerSseClient(res);
+          return;
+        }
+
+        const filePath = resolveServedFile(resolvedWorkDir, url.pathname);
+        if (!filePath) {
+          res.writeHead(404);
+          res.end();
+          return;
+        }
+
+        fs.readFile(filePath, (err, data) => {
+          if (err) {
+            res.writeHead(404);
+            res.end();
+            return;
+          }
+          res.writeHead(200, { "Content-Type": fileContentType(filePath) });
+          res.end(data);
+        });
+      });
+
+      server.listen(0, "127.0.0.1", () => {
+        const address = server.address();
+        if (!address || typeof address === "string") {
+          reject(new Error("Failed to bind dashboard server"));
+          return;
+        }
+        dashboardServer = server;
+        dashboardServerPort = address.port;
+        dashboardServerWorkDir = resolvedWorkDir;
+        resolve(address.port);
+      });
+
+      server.on("error", reject);
+    });
+  }
+
+  async function exportDashboard(ctx: ExtensionContext): Promise<void> {
+    const workDir = resolveWorkDir(ctx.cwd);
+    const jsonlPath = autoresearchJsonlPath(workDir);
+
+    if (!fs.existsSync(jsonlPath)) {
+      ctx.ui.notify("No autoresearch.jsonl found \u2014 run some experiments first", "error");
+      return;
+    }
+
+    try {
+      const dashboardHtmlPath = writeDashboardFile(workDir);
+      const port = await startStaticServer(workDir, dashboardHtmlPath);
+      const url = `http://127.0.0.1:${port}`;
+      openInBrowser(url);
+      ctx.ui.notify(`Dashboard at ${url} (live updates)`, "info");
+    } catch (error) {
+      ctx.ui.notify(
+        `Export failed: ${error instanceof Error ? error.message : String(error)}`,
+        "error"
+      );
+    }
+  }
+
+  // -----------------------------------------------------------------------
   // /autoresearch command — enter autoresearch mode
   // -----------------------------------------------------------------------
 
@@ -2615,30 +3003,46 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       if (command === "off") {
+        const wasRunning = !ctx.isIdle();
+
         runtime.autoresearchMode = false;
-        runtime.lastAutoResumeTime = 0;
+        runtime.dashboardExpanded = false;
         runtime.autoResumeTurns = 0;
         runtime.experimentsThisSession = 0;
         runtime.lastRunChecks = null;
+        runtime.lastRunDuration = null;
         runtime.runningExperiment = null;
         runtime.phase = 'idle';
         runtime.lastRunResult = null;
-        ctx.ui.notify("Autoresearch mode OFF", "info");
+        cancelPendingResume(runtime);
+        stopDashboardServer();
+        clearSessionUi(ctx);
+        if (wasRunning) ctx.abort();
+        ctx.ui.notify(
+          wasRunning ? "Autoresearch mode OFF — aborting current run" : "Autoresearch mode OFF",
+          "info"
+        );
+        return;
+      }
+
+      if (command === "export") {
+        await exportDashboard(ctx);
         return;
       }
 
       if (command === "clear") {
-        const jsonlPath = path.join(resolveWorkDir(ctx.cwd), "autoresearch.jsonl");
+        const jsonlPath = autoresearchJsonlPath(resolveWorkDir(ctx.cwd));
         runtime.autoresearchMode = false;
         runtime.dashboardExpanded = false;
-        runtime.lastAutoResumeTime = 0;
         runtime.autoResumeTurns = 0;
         runtime.experimentsThisSession = 0;
         runtime.lastRunChecks = null;
         runtime.runningExperiment = null;
         runtime.phase = 'idle';
         runtime.lastRunResult = null;
+        cancelPendingResume(runtime);
         runtime.state = createExperimentState();
+        stopDashboardServer();
         updateWidget(ctx);
 
         if (fs.existsSync(jsonlPath)) {
@@ -2665,18 +3069,29 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       runtime.autoresearchMode = true;
       runtime.autoResumeTurns = 0;
 
-      const mdPath = path.join(resolveWorkDir(ctx.cwd), "autoresearch.md");
-      const hasRules = fs.existsSync(mdPath);
+      const workDir = resolveWorkDir(ctx.cwd);
+      const rulesLoaded = hasAutoresearchRules(ctx);
+      const kickoff = rulesLoaded
+        ? `Autoresearch mode active. ${trimmedArgs} ${BENCHMARK_GUARDRAIL}`
+        : `Start autoresearch: ${trimmedArgs} ${BENCHMARK_GUARDRAIL}`;
 
-      if (hasRules) {
-        ctx.ui.notify("Autoresearch mode ON — rules loaded from autoresearch.md", "info");
-        pi.sendUserMessage(`Autoresearch mode active. ${trimmedArgs} ${BENCHMARK_GUARDRAIL}`);
-      } else {
-        ctx.ui.notify("Autoresearch mode ON — no autoresearch.md found, setting up", "info");
-        pi.sendUserMessage(
-          `Start autoresearch: ${trimmedArgs} ${BENCHMARK_GUARDRAIL}`
-        );
-      }
+      ctx.ui.notify(
+        rulesLoaded
+          ? "Autoresearch mode ON — rules loaded from autoresearch.md"
+          : "Autoresearch mode ON — no autoresearch.md found, setting up",
+        "info",
+      );
+
+      const state = runtime.state;
+      const activationSteer = await fireHook({
+        event: "before",
+        cwd: workDir,
+        next_run: state.results.length + 1,
+        last_run: readLastRun(workDir),
+        session: buildSessionSnapshot(state),
+      });
+
+      sendWhenReady(ctx, activationSteer ? `${activationSteer}\n\n${kickoff}` : kickoff);
     },
   });
 }
